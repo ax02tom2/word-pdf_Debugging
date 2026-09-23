@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！整合彩色頁過濾、圖表順序、空白頁及**內文錯別字與邏輯檢核**。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾必要彩色頁、揪出圖表號跳號、空白頁與頁碼異常。"
 )
 
 uploaded_file = st.file_uploader(
@@ -47,7 +47,7 @@ if uploaded_file is not None:
       page = doc[page_num]
       actual_page = page_num + 1
 
-      # 1. 色彩判定
+      # 1. 嚴格彩色頁判定邏輯（排除微量文字或黑白夾雜）
       pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
@@ -99,11 +99,10 @@ if uploaded_file is not None:
   st.success("✅ 檔案解析完成！")
 
   # --- 頁籤介面 ---
-  tab1, tab2, tab3, tab4, tab5 = st.tabs([
+  tab1, tab2, tab3, tab4 = st.tabs([
       "🖨️ 列印色彩建議",
       "📊 圖表號順序檢核",
       "📄 實質空白頁檢核",
-      "🔍 內文錯字與邏輯檢核",
       "🔢 頁碼連續性檢核",
   ])
 
@@ -115,38 +114,58 @@ if uploaded_file is not None:
             f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**："
             f" `{', '.join(map(str, color_pages))}`"
         )
+        st.info(
+            "💡 系統已自動過濾微量色彩與純黑白頁，僅挑出包含照片、地圖或顯著彩色圖表的頁面。"
+        )
       else:
-        st.info("✨ 本文件經判定全篇為黑白呈現即可。")
+        st.info("✨ 本文件經評價全篇為黑白呈現即可。")
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體彩色頁，建議另存成 PDF 後上傳。")
 
   with tab2:
     st.subheader("📊 圖表號連續性與跳號檢核")
+    st.write(
+        "系統自動抓取文件中的圖表編號（例如 圖 1-1、表 2-1 等），檢查是否有順序跳號或顛倒："
+    )
+
     fig_records = []
     for p_num, t in page_texts if is_pdf else [("Word", full_text)]:
+      # 捕捉如 圖1-1, 表 2-1, 圖1 等格式
       matches = re.findall(
           r"(圖\s*\d+[\-\d]*|表\s*\d+[\-\d]*|Figure\s*\d+|Table\s*\d+)", t
       )
       for m in matches:
+        # 為了避免內文重複提及造成干擾，我們只記錄每個圖表號第一次出現的頁面與編號
         clean_name = m.replace(" ", "")
         nums = re.findall(r"\d+", m)
         if nums:
-          main_num = int(nums[0])
+          main_num = int(nums[0])  # 以主要編號數字作排序依據
           fig_records.append({"page": p_num, "label": clean_name, "num": main_num})
 
     if fig_records:
+      # 篩選出獨特的圖表標籤清單，並檢查數字順序
       unique_figs = {}
       for item in fig_records:
         if item["label"] not in unique_figs:
           unique_figs[item["label"]] = item["page"]
 
+      st.write(
+          f"📁 共偵測到 {len(unique_figs)} 個不重複的圖表標籤（內文重複提及已自動略過比對）："
+      )
+
+      # 顯示前幾筆抓到的圖表作為對照
+      st.json(unique_figs, expanded=False)
+
+      # 檢查是否有數字順序跳號（針對純數字或主編號）
       numbers_only = [
           int(re.findall(r"\d+", k)[0])
           for k in unique_figs.keys()
           if re.findall(r"\d+", k)
       ]
+      # 排序並檢查連續性
       issues = []
       if len(numbers_only) > 1:
+        # 簡單檢查是否有大於 1 的落差（排除章節編號如 1-1 的情況，這裡主要看流水號）
         sorted_nums = sorted(list(set(numbers_only)))
         for i in range(len(sorted_nums) - 1):
           if (
@@ -185,57 +204,6 @@ if uploaded_file is not None:
       st.info("Word 格式建議透過 Word 預覽模式檢查空白頁。")
 
   with tab4:
-    st.subheader("🔍 內文錯字、標點符號與邏輯一致性檢核")
-    st.write(
-        "系統針對內文進行自動掃描，挑出常見公文筆誤、全半形標點符號錯置以及年份邏輯疑慮："
-    )
-
-    text_issues = []
-
-    # 1. 檢查常見公文與工程報告易混淆錯別字
-    common_typos = {
-        "做": "作 (工程/公文書寫建議多用「作」)",
-        "佈": "布 (我國公文書體標準多用「布」)",
-        "暨": "及 (確認前後是否為平等並列關係)",
-        "裏": "裡",
-        "夠": "夠",
-    }
-
-    # 2. 逐頁或逐段檢核
-    for p_num, t in page_texts:
-      # 檢查全形/半形標點符號異常（例如連續句號、中英文符號混用）
-      if ".." in t or "%%" in t or "  " in t:
-        text_issues.append(
-            f"• **第 {p_num} 頁**：發現連續符號或多處連續空白，可能影響排版美觀。"
-        )
-
-      # 檢查年份邏輯（例如 115 年與 2026 年是否同時出現或對應正確）
-      if "115" in t and "2026" not in t:
-        # 這只是提醒確保民國與西元對應
-        pass
-
-      # 檢查常見錯別字或不規範用詞
-      for wrong, hint in common_typos.items():
-        if wrong in t and p_num != "Word":
-          # 限制不要抓太多避免洗版，僅作重點提示
-          pass
-
-      # 檢查中文字連續重複（如：的的地地）
-      repeats = re.findall(r"([\u4e00-\u9fa5])\1{1,}", t)
-      if repeats:
-        text_issues.append(
-            f"• **第 {p_num} 頁**：發現中文字元連續重複（如 `{set(repeats)}`），請確認是否為手誤。"
-        )
-
-    if text_issues:
-      for issue in text_issues[:20]:
-        st.warning(issue)
-      if len(text_issues) > 20:
-        st.caption(f"...還有其他 {len(text_issues)-20} 項次細微提醒未顯示。")
-    else:
-      st.success("✨ 未在內文中偵測到明顯的重複字元或重大格式錯誤。")
-
-  with tab5:
     st.subheader("🔢 頁碼連續性檢核")
     if is_pdf:
       st.info(f"📁 總計掃描 {total_pages} 個實體頁面，頁碼結構排序正常。")
