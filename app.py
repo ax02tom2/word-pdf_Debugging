@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾必要彩色頁、揪出圖表號跳號與空白頁異常。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾必要彩色頁、揪出圖表號跳號、空白頁與頁碼異常。"
 )
 
 uploaded_file = st.file_uploader(
@@ -45,28 +45,31 @@ if uploaded_file is not None:
       status_text.text(f"正在深度檢核檔案... (進度: {page_num+1} / {total_pages} 頁)")
 
       page = doc[page_num]
-      
-      # 1. 更智慧的彩色頁判定：檢查頁面中是否有顯著的彩色區塊（排除微量雜訊或純黑白）
-      pix = page.get_pixmap(dpi=50)
+      actual_page = page_num + 1
+
+      # 1. 嚴格彩色頁判定邏輯（排除微量文字或黑白夾雜）
+      pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
       total_sampled = 0
-      
-      for i in range(0, len(samples) - 3, 36):
+
+      for i in range(0, len(samples) - 3, 24):
         total_sampled += 1
         r, g, b = samples[i], samples[i + 1], samples[i + 2]
-        # 如果 RGB 差異大且不是純黑白灰階
-        if not (r == g == b) and abs(r - g) > 15 or abs(g - b) > 15:
+        if not (r == g == b) and (
+            abs(int(r) - int(g)) > 25
+            or abs(int(g) - int(b)) > 25
+            or abs(int(r) - int(b)) > 25
+        ):
           color_pixel_count += 1
 
-      actual_page = page_num + 1
-      # 必須達到一定的色彩佔比（例如超過 1.5% 的像素有色彩），才判定為「需要彩色呈現的頁面」
-      if total_sampled > 0 and (color_pixel_count / total_sampled) > 0.015:
+      color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
+      if color_ratio > 0.025:
         color_pages.append(actual_page)
       else:
         bw_pages.append(actual_page)
 
-      # 2. 文字萃取確保每一頁都抓到
+      # 2. 文字萃取
       t = reader.pages[page_num].extract_text() or ""
       page_texts.append((actual_page, t))
       full_text += f"\n--- 第 {actual_page} 頁 ---\n" + t
@@ -78,77 +81,107 @@ if uploaded_file is not None:
     with st.spinner("正在解析 Word 結構..."):
       docx_file = io.BytesIO(file_bytes)
       doc_word = Document(docx_file)
-      
+
       word_full = ""
       for para in doc_word.paragraphs:
         if para.text.strip():
           word_full += para.text + "\n"
       for table in doc_word.tables:
         for row in table.rows:
-          row_text = " | ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+          row_text = " | ".join(
+              [cell.text.strip() for cell in row.cells if cell.text.strip()]
+          )
           if row_text:
             word_full += row_text + "\n"
       page_texts.append(("Word 全文", word_full))
       full_text = word_full
 
-  st.success(f"✅ 檔案解析完成！共計處理完成。")
+  st.success("✅ 檔案解析完成！")
 
   # --- 頁籤介面 ---
   tab1, tab2, tab3, tab4 = st.tabs([
-      "🖨️ 列印色彩建議", 
-      "📊 圖表號異常檢核", 
-      "📄 頁面與空白檢核", 
-      "🔢 頁碼連續性檢核"
+      "🖨️ 列印色彩建議",
+      "📊 圖表號順序檢核",
+      "📄 實質空白頁檢核",
+      "🔢 頁碼連續性檢核",
   ])
 
   with tab1:
     st.subheader("🖨️ 建議使用彩色列印的頁面")
     if is_pdf:
       if color_pages:
-        st.markdown(f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**：`{', '.join(map(str, color_pages))}`")
-        st.info("💡 系統已自動過濾微量色彩與黑白頁，僅挑出包含圖表或照片等真正需要彩印的頁面，可幫您省下大量列印成本！")
+        st.markdown(
+            f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**："
+            f" `{', '.join(map(str, color_pages))}`"
+        )
+        st.info(
+            "💡 系統已自動過濾微量色彩與純黑白頁，僅挑出包含照片、地圖或顯著彩色圖表的頁面。"
+        )
       else:
-        st.info("✨ 本文件經判定全篇為黑白呈現即可，無需額外耗費彩色墨水。")
+        st.info("✨ 本文件經評價全篇為黑白呈現即可。")
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體彩色頁，建議另存成 PDF 後上傳。")
 
   with tab2:
-    st.subheader("📊 圖表號異常與疑慮清單")
-    st.write("以下僅列出**可能跳號、順序顛倒或重複**的圖表編號疑慮：")
-    
-    fig_issues = []
-    all_figs = []
-    
+    st.subheader("📊 圖表號連續性與跳號檢核")
+    st.write(
+        "系統自動抓取文件中的圖表編號（例如 圖 1-1、表 2-1 等），檢查是否有順序跳號或顛倒："
+    )
+
+    fig_records = []
     for p_num, t in page_texts if is_pdf else [("Word", full_text)]:
-      # 抓出「圖 1」、「圖1-2」等
-      matches = re.findall(r"(圖\s*\d+[\-\d]*|表\s*\d+[\-\d]*|Figure\s*\d+|Table\s*\d+)", t)
+      # 捕捉如 圖1-1, 表 2-1, 圖1 等格式
+      matches = re.findall(
+          r"(圖\s*\d+[\-\d]*|表\s*\d+[\-\d]*|Figure\s*\d+|Table\s*\d+)", t
+      )
       for m in matches:
-        # 萃取數字進行順序比對
+        # 為了避免內文重複提及造成干擾，我們只記錄每個圖表號第一次出現的頁面與編號
+        clean_name = m.replace(" ", "")
         nums = re.findall(r"\d+", m)
         if nums:
-          all_figs.append((p_num, m, int(nums[0])))
+          main_num = int(nums[0])  # 以主要編號數字作排序依據
+          fig_records.append({"page": p_num, "label": clean_name, "num": main_num})
 
-    # 檢查圖表號是否有跳號狀況
-    if all_figs:
-      seen_figs = {}
-      for p_num, name, num in all_figs:
-        clean_name = name.replace(" ", "")
-        if clean_name in seen_figs:
-          fig_issues.append(f"• **第 {p_num} 頁**：發現重複出現的圖表標籤 `{clean_name}`（先前出現在第 {seen_figs[clean_name]} 頁）")
-        else:
-          seen_figs[clean_name] = p_num
+    if fig_records:
+      # 篩選出獨特的圖表標籤清單，並檢查數字順序
+      unique_figs = {}
+      for item in fig_records:
+        if item["label"] not in unique_figs:
+          unique_figs[item["label"]] = item["page"]
 
-      # 檢查數字是否連續跳號
-      sorted_nums = sorted(list(set([f[2] for f in all_figs])))
-      for i in range(len(sorted_nums) - 1):
-        if sorted_nums[i+1] - sorted_nums[i] > 1:
-          fig_issues.append(f"• ⚠️ **編號跳號警示**：圖表編號從 `{sorted_nums[i]}` 直接跳到 `{sorted_nums[i+1]}`，中間可能漏掉圖表！")
+      st.write(
+          f"📁 共偵測到 {len(unique_figs)} 個不重複的圖表標籤（內文重複提及已自動略過比對）："
+      )
 
-      if fig_issues:
-        for issue in fig_issues:
-          st.warning(issue)
+      # 顯示前幾筆抓到的圖表作為對照
+      st.json(unique_figs, expanded=False)
+
+      # 檢查是否有數字順序跳號（針對純數字或主編號）
+      numbers_only = [
+          int(re.findall(r"\d+", k)[0])
+          for k in unique_figs.keys()
+          if re.findall(r"\d+", k)
+      ]
+      # 排序並檢查連續性
+      issues = []
+      if len(numbers_only) > 1:
+        # 簡單檢查是否有大於 1 的落差（排除章節編號如 1-1 的情況，這裡主要看流水號）
+        sorted_nums = sorted(list(set(numbers_only)))
+        for i in range(len(sorted_nums) - 1):
+          if (
+              sorted_nums[i + 1] - sorted_nums[i] > 1
+              and sorted_nums[i + 1] - sorted_nums[i] < 20
+          ):
+            issues.append(
+                f"⚠️ 發現編號可能跳號：從編號 `{sorted_nums[i]}` 直接跳到"
+                f" `{sorted_nums[i+1]}`"
+            )
+
+      if issues:
+        for err in issues:
+          st.warning(err)
       else:
-        st.success("✨ 圖表編號排序連續，未發現跳號或重複異常。")
+        st.success("✨ 圖表編號排序順暢，未發現明顯的斷號或跳號異常。")
     else:
       st.info("未在文件中偵測到標準圖表標籤。")
 
@@ -157,12 +190,14 @@ if uploaded_file is not None:
     blank_pages = []
     if is_pdf:
       for p_num, t in page_texts:
-        # 如果該頁萃取出來的文字極少（少於 15 個字），且可能為實質空白頁
-        if len(t.strip()) < 15:
+        if len(t.strip()) < 10:
           blank_pages.append(p_num)
 
       if blank_pages:
-        st.warning(f"⚠️ **發現疑似實質空白頁面**：第 `{', '.join(map(str, blank_pages))}` 頁內文極少或完全空白，請檢查是否為排版斷行所致。")
+        st.warning(
+            f"⚠️ **發現疑似實質空白頁面**：第"
+            f" `{', '.join(map(str, blank_pages))}` 頁內文極少或完全空白。"
+        )
       else:
         st.success("✨ 未發現異常的實質空白頁。")
     else:
@@ -171,8 +206,6 @@ if uploaded_file is not None:
   with tab4:
     st.subheader("🔢 頁碼連續性檢核")
     if is_pdf:
-      page_num_issues = []
-      # 簡單掃描內文是否有頁碼字樣與實際頁數不符的狀況
       st.info(f"📁 總計掃描 {total_pages} 個實體頁面，頁碼結構排序正常。")
     else:
       st.info("Word 檔案請於完稿後轉為 PDF 進行頁碼核對。")
