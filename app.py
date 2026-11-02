@@ -251,7 +251,7 @@ def page_has_real_color(page, image_color_cache=None, level="normal"):
 # ── 判定規則（只有兩份關鍵字清單，且只看「圖表標題／短行」，內文敘述提到不算）──
 DEFAULT_COLOR_KEYWORDS = [
     "工作進度表", "進度表", "傾斜量歷時曲線", "立體投影圓分析", "立體投影圓", "位態分析",
-    "gps", "gnss", "雙軸傾斜計", "變位歷時曲線", "變位歷時",
+    "gps", "gnss", "雙軸傾斜計", "變位歷時曲線", "變位歷時", "地質剖面圖",
 ]
 DEFAULT_BW_KEYWORDS = [
     "雨量圖", "雨量歷線", "降雨歷線", "降雨量歷線", "雨量柱狀圖",
