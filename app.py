@@ -13,8 +13,8 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！自動區分 **A3/A4 尺寸**、精準排除純文字與純背景色表格、"
-    "僅保留**真正的彩色圖表/進度表/立體投影圓分析**相關頁面為彩色，並以頓號與區段格式呈現。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾雨量圖表與表格網底、"
+    "自動區分 **A3/A4 尺寸**、僅保留工作進度表、GPS/GNSS/雙軸傾斜計與立體投影圓分析相關頁面為彩色。"
 )
 
 uploaded_file = st.file_uploader(
@@ -79,13 +79,16 @@ if uploaded_file is not None:
       t = reader.pages[page_num].extract_text() or ""
       t_lower = t.lower()
 
-      # 1. 偵測頁面尺寸 (A3 面積或寬度顯著大於 A4)
+      # 1. 偵測頁面尺寸 (A3 面積顯著大於 A4)
       rect = page.rect
       width, height = rect.width, rect.height
       page_area = width * height
-      is_a3 = page_area > 600000  # A3 面積門檻判斷
+      is_a3 = page_area > 600000
 
-      # 2. 強制彩印的關鍵字（工作進度表、GPS、GNSS、雙軸傾斜計、立體投影圓分析相關）
+      # 2. 嚴格黑白保護傘：只要含有「雨量」或「降雨」字眼，絕對強制判定為黑白頁，不參與任何彩色篩選
+      is_rain_page = "雨量" in t or "降雨" in t
+
+      # 3. 強制彩印的特定工程關鍵字
       forced_color_keywords = [
           "工作進度表",
           "進度表",
@@ -97,11 +100,11 @@ if uploaded_file is not None:
           "立體投影圓",
           "位態",
       ]
-      has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
+      has_forced_keyword = (
+          any(kw in t_lower for kw in forced_color_keywords) and not is_rain_page
+      )
 
-      # 3. 嚴格過濾底色干擾的像素色彩分析
-      # 報表中常見的淺綠色/灰色網底（如 R, G, B 數值相近但略有偏差的淡色背景），
-      # 我們必須提高色差門檻與飽和度判定，排除純表格與純文字頁的背景底色誤判。
+      # 4. 像素色彩分析（排除表格網底與微量雜訊）
       pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
@@ -110,28 +113,20 @@ if uploaded_file is not None:
       for i in range(0, len(samples) - 3, 24):
         total_sampled += 1
         r, g, b = int(samples[i]), int(samples[i + 1]), int(samples[i + 2])
-
-        # 排除接近白色、灰色、以及常見的淺綠色網底（綠色通道偏高但色差不大的淡網底）
-        # 只有當色差非常明顯（代表是真正的彩色圖片、照片或紅藍線條圖表）時計入
         max_rgb = max(r, g, b)
         min_rgb = min(r, g, b)
-        saturation = (
-            (max_rgb - min_rgb) / max_rgb if max_rgb > 0 else 0
-        )  # 計算色彩飽和度
+        saturation = (max_rgb - min_rgb) / max_rgb if max_rgb > 0 else 0
 
-        # 必須具備一定飽和度（排除淡綠色/灰色背景底色），且 RGB 差異夠大
-        if saturation > 0.18 and (
-            abs(r - g) > 35 or abs(g - b) > 35 or abs(r - b) > 35
+        if saturation > 0.2 and (
+            abs(r - g) > 40 or abs(g - b) > 40 or abs(r - b) > 40
         ):
-          # 同時排除大面積單一淡色網底填滿的情況
-          if not (r > 200 and g > 200 and b > 200):  # 排除亮色區塊
+          if not (r > 200 and g > 200 and b > 200):
             color_pixel_count += 1
 
       color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
 
-      # 4. 綜合判定彩色頁與尺寸分流
-      # 必須包含強制關鍵字，或是真正的彩色圖像比例超過 1.5%，才判定為彩色頁
-      if has_forced_keyword or color_ratio > 0.015:
+      # 5. 最終判定：雨量頁絕對黑白；其餘若有強制關鍵字或高飽和彩色比例才歸類為彩色
+      if not is_rain_page and (has_forced_keyword or color_ratio > 0.04):
         if is_a3:
           a3_color_pages.append(actual_page)
         else:
@@ -186,8 +181,8 @@ if uploaded_file is not None:
           f"🎨 **本文 A4 彩色頁 ({len(a4_color_pages)} 頁)**：`{a4_str}`"
       )
       st.info(
-          "💡 系統已升級過濾演算法，可自動略過帶有淺綠色或灰色背景網底的「純文字/純表格」頁面，"
-          "僅保留 **工作進度表**、**GPS、GNSS、雙軸傾斜計** 與 **立體投影圓分析 / 位態** 相關頁面為彩色！"
+          "💡 雨量圖表已全面鎖定為黑白，一般表格網底也已排除。僅精準保留"
+          " **工作進度表**、**GPS、GNSS、雙軸傾斜計** 與 **立體投影圓分析 / 位態** 相關頁面，頁碼已自動轉為區段與頓號格式！"
       )
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
