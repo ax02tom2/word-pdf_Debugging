@@ -181,13 +181,16 @@ if uploaded_file is not None:
       ]
       has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
+      # 雨量／降雨頁面優先強制黑白；即使同頁含有其他彩色元素，也不列入彩印清單。
+      forced_bw_keywords = ["雨量", "降雨"]
+      has_forced_bw_keyword = any(kw in t_lower for kw in forced_bw_keywords)
+
       # 3. 分析真正彩色內容：淡色表格網底不單獨構成彩色頁；嵌入圖片獨立判讀。
       has_real_color, color_reason = page_has_real_color(page)
       color_diagnostics.append((actual_page, "A3" if is_a3 else "A4", color_reason, has_forced_keyword, has_forced_bw_keyword))
 
-      # 4. 綜合判定彩色頁與尺寸分流
-      # 必須包含強制關鍵字，或是真正的彩色圖像比例超過 1.5%，才判定為彩色頁
-      if has_forced_keyword or color_ratio > 0.015:
+      # 4. 綜合判定彩色頁與尺寸分流。強制黑白優先，其次才套用強制彩印或影像辨識。
+      if (not has_forced_bw_keyword) and (has_forced_keyword or has_real_color):
         if is_a3:
           a3_color_pages.append(actual_page)
         else:
