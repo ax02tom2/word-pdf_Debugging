@@ -13,8 +13,8 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾單純黑白表格、"
-    "強制保留 GPS/GNSS/雙軸傾斜計與【立體投影圓分析】相關頁面為彩色，並優化連續頁碼區段（如 1-6、8-10）。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！自動區分 **A3/A4 尺寸**、精準過濾純文字與純表格頁、"
+    "強制保留 **工作進度表**、GPS/GNSS/雙軸傾斜計與【立體投影圓分析】相關頁面為彩色，並以頓號與區段格式呈現。"
 )
 
 uploaded_file = st.file_uploader(
@@ -30,7 +30,7 @@ if uploaded_file is not None:
   is_pdf = file_extension == "pdf"
 
 
-  # --- 輔助函式：將連續頁碼轉為 1-6、8-10 格式，並以頓號分隔 ---
+  # --- 輔助函式：將連續頁碼轉為 2-3、5、8-10 格式，並以頓號分隔 ---
   def format_pages_to_ranges(page_list):
     if not page_list:
       return "無"
@@ -64,8 +64,8 @@ if uploaded_file is not None:
 
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(doc)
-    color_pages = []
-    bw_pages = []
+    a4_color_pages = []
+    a3_color_pages = []
 
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
 
@@ -79,8 +79,16 @@ if uploaded_file is not None:
       t = reader.pages[page_num].extract_text() or ""
       t_lower = t.lower()
 
-      # 1. 強制彩印的關鍵字（包含 GPS, GNSS, 雙軸傾斜計, 以及立體投影圓分析相關）
+      # 1. 偵測頁面尺寸 (A3 面積或寬度顯著大於 A4)
+      rect = page.rect
+      width, height = rect.width, rect.height
+      page_area = width * height
+      is_a3 = page_area > 600000  # A3 面積門檻判斷
+
+      # 2. 強制彩印的關鍵字（包含工作進度表、GPS、GNSS、雙軸傾斜計、立體投影圓分析相關）
       forced_color_keywords = [
+          "工作進度表",
+          "進度表",
           "gps",
           "gnss",
           "雙軸傾斜計",
@@ -91,7 +99,7 @@ if uploaded_file is not None:
       ]
       has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
-      # 2. 像素色彩分析
+      # 3. 像素色彩分析（過濾單純文字與一般黑白表格）
       pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
@@ -109,13 +117,12 @@ if uploaded_file is not None:
 
       color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
 
-      # 3. 綜合判定邏輯：
-      # - 若包含指定關鍵字（如立體投影圓分析、GPS等）或是顯著彩色圖像（比例大於 3%），判為彩色頁。
-      # - 若是單純表格或純黑白文字頁（即使有微量色塊雜訊），一律歸類為黑白頁。
+      # 4. 綜合判定彩色頁與尺寸分流
       if has_forced_keyword or color_ratio > 0.03:
-        color_pages.append(actual_page)
-      else:
-        bw_pages.append(actual_page)
+        if is_a3:
+          a3_color_pages.append(actual_page)
+        else:
+          a4_color_pages.append(actual_page)
 
       page_texts.append((actual_page, t))
       full_text += f"\n--- 第 {actual_page} 頁 ---\n" + t
@@ -154,21 +161,23 @@ if uploaded_file is not None:
   ])
 
   with tab1:
-    st.subheader("🖨️ 建議使用彩色列印的頁面")
+    st.subheader("🖨️ 建議使用彩色列印的頁面（依尺寸分類）")
     if is_pdf:
-      color_str = format_pages_to_ranges(color_pages)
-      bw_str = format_pages_to_ranges(bw_pages)
+      a3_str = format_pages_to_ranges(a3_color_pages)
+      a4_str = format_pages_to_ranges(a4_color_pages)
 
       st.markdown(
-          f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**：`{color_str}`"
+          f"🎨 **本文 A3 彩色頁 ({len(a3_color_pages)} 頁)**：`{a3_str}`"
       )
-      st.markdown(f"⬛ **建議黑白輸出頁面**：`{bw_str}`")
+      st.markdown(
+          f"🎨 **本文 A4 彩色頁 ({len(a4_color_pages)} 頁)**：`{a4_str}`"
+      )
       st.info(
-          "💡 系統已自動排除單純黑白表格頁面，並強制將包含 **GPS、GNSS、雙軸傾斜計**"
-          " 以及 **立體投影圓分析 / 位態** 相關的成果頁面納入彩印清單中，頁碼區段已自動以頓號（`、`）區隔！"
+          "💡 系統已自動排除一般純文字與純表格，並將 **工作進度表**、**GPS、GNSS、雙軸傾斜計**"
+          " 與 **立體投影圓分析 / 位態** 相關頁面強制納入對應尺寸的彩印清單中，頁碼已自動轉換為區段與頓號格式！"
       )
     else:
-      st.warning("⚠️ Word 檔案無法直接精準判定實體彩色頁，建議另存成 PDF 後上傳。")
+      st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
 
   with tab2:
     st.subheader("📊 圖表號連續性與跳號檢核")
