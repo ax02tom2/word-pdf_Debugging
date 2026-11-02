@@ -319,46 +319,82 @@ def _title_hits(raw_text, keywords, caption_only=False):
   return sorted(hits)
 
 
+def _page_captions(raw_text):
+  """頁面上所有「圖／表＋編號」標題行（已正規化；編號與圖名分兩行時合併）。"""
+  lines = [l for l in raw_text.splitlines() if l.strip()]
+  caps = []
+  for i, line in enumerate(lines):
+    n = _norm_line(line)
+    m = CAPTION_RE.match(n)
+    if not m:
+      continue
+    if len(n) - m.end() <= 1 and i + 1 < len(lines):
+      n += _norm_line(lines[i + 1])
+    if len(n) <= 80:
+      caps.append(NEGATION_RE.sub("", n))
+  return caps
+
+
+def _page_headings(raw_text, count=4, max_len=40):
+  """頁面最前面幾行的短行（頁首標題），不含圖／表標題行。"""
+  heads = []
+  for line in [l for l in raw_text.splitlines() if l.strip()][:count]:
+    n = _norm_line(line)
+    if 0 < len(n) <= max_len and not CAPTION_RE.match(n):
+      heads.append(NEGATION_RE.sub("", n))
+  return heads
+
+
+def _kw_hits(texts, keywords):
+  return sorted({kw for n in texts for kw in keywords if _kw_in(n, kw)})
+
+
 def decide_page_color(ev, t_raw):
   """回傳 (是否彩色, 規則, 原因, 彩色關鍵字, 黑白關鍵字)。
 
+  黑白關鍵字只在「整頁的圖表標題都屬黑白類」時才生效：頁面若同時有其他圖表
+  （標題不含任何黑白關鍵字），代表是混合頁，文字不得壓過頁面實際圖片色彩。
+
   判定順序（由上而下，命中即停）：
-    ① 標題／短行含「絕對黑白」關鍵字 → 黑白（不受圖片影響）
+    ① 標題／頁首含「絕對黑白」關鍵字，且無其他圖表 → 黑白（不受圖片影響）
     ②③ 標題／短行含「彩色關鍵字」，且頁面有實質彩色圖片／圖形 → 彩色（無圖頁不算）
-    ④ 圖表標題含「一般黑白」關鍵字 → 黑白（同頁有豐富彩色圖片則例外）
+    ④ 標題含「一般黑白」關鍵字，且無其他圖表 → 黑白（有豐富彩色圖片則例外）
     ⑤ 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
   目錄頁略過 ①~④。
   """
   toc = _looks_like_toc(t_raw)
   c_cap = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS, caption_only=True)
   c_short = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS)
-  # 黑白關鍵字只認「圖／表 x」標題行；圖內座標軸文字（如「日雨量(mm)」）不算。
-  bw_short = [] if toc else _title_hits(t_raw, BW_SOFT_KEYWORDS, caption_only=True)
-  # 絕對黑白清單：標題行與 40 字內短行都比對。
-  bw_strict = [] if toc else sorted(set(
-      _title_hits(t_raw, BW_KEYWORDS, caption_only=True) + _title_hits(t_raw, BW_KEYWORDS)
-  ))
 
-  if bw_strict:
-    return False, "①絕對黑白", "標題／短行命中「絕對黑白」關鍵字，不受圖片彩色影響", c_short, bw_strict
+  caps = [] if toc else _page_captions(t_raw)
+  heads = [] if toc else _page_headings(t_raw)
+  all_bw = BW_KEYWORDS + BW_SOFT_KEYWORDS
+  other_caps = [n for n in caps if not any(_kw_in(n, kw) for kw in all_bw)]
+  strict_hits = _kw_hits(caps + heads, BW_KEYWORDS)
+  soft_hits = _kw_hits(caps, BW_SOFT_KEYWORDS)
+  mixed = bool(other_caps)  # 同頁另有不屬黑白類的圖表
+
+  if strict_hits and not mixed:
+    return False, "①絕對黑白", "標題／頁首命中「絕對黑白」關鍵字，不受圖片彩色影響", c_short, strict_hits
 
   if c_cap or c_short:
-    # 標題命中只是「值得檢查」；頁面必須真有彩色圖片／圖形才判彩色，無圖頁（純文字、目錄式列舉）不算。
     ok, why, sig = evidence_has_color(ev, "lenient")
     if ok:
-      return True, ("②彩色標題＋實際彩色" if c_cap else "③短行關鍵字＋實際彩色"), why, c_short, bw_short
-    # 沒有彩色證據 → 不採彩色，繼續往下判定（黑白標題或實際色彩）
-  if bw_short:
+      return True, ("②彩色標題＋實際彩色" if c_cap else "③短行關鍵字＋實際彩色"), why, c_short, strict_hits + soft_hits
+
+  if soft_hits and not mixed:
     ok, why, sig = evidence_has_color(ev, "rich")
     if ok:
-      return True, "④一般黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
+      return True, "④一般黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, soft_hits
     detail = f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}，需占比≥0.010、色相≥3、色階≥50 才例外判彩色］" if sig else "［無圖片／渲染特徵］"
-    return False, "④一般黑白標題", "圖表標題命中「一般黑白」關鍵字" + detail, c_short, bw_short
+    return False, "④一般黑白標題", "圖表標題命中「一般黑白」關鍵字" + detail, c_short, soft_hits
 
   has_color, reason, sig = evidence_has_color(ev, "normal")
   if sig:
     reason += f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}］"
-  return has_color, "⑤實際色彩", reason, c_short, bw_short
+  if (strict_hits or soft_hits) and mixed:
+    reason = "同頁另有其他圖表，黑白關鍵字不壓過實際色彩；" + reason
+  return has_color, "⑤實際色彩", reason, c_short, strict_hits + soft_hits
 
 
 def _parse_keyword_lines(value):
@@ -417,9 +453,9 @@ if "color_keyword_rules" not in st.session_state:
 
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
   st.markdown(
-      "**判定順序**：①標題／短行含「絕對黑白」關鍵字 → 黑白（不受圖片影響）　"
+      "**判定順序**：①圖表標題／頁首含「絕對黑白」關鍵字 → 黑白（不受圖片影響；同頁另有其他圖表時不套用）　"
       "②③標題或短行含彩色關鍵字，且頁面確有彩色圖片／圖形 → 彩色（無圖頁不算）　"
-      "④圖表標題含「一般黑白」關鍵字 → 黑白（同頁若有色相／色階豐富的彩色圖片則例外判彩色）　"
+      "④圖表標題含「一般黑白」關鍵字 → 黑白（同頁若有色相／色階豐富的彩色圖片則例外判彩色；同頁另有其他圖表時不套用）　"
       "⑤其餘依實際圖片／向量色彩判定。  \n"
       "標題＝「圖／表＋編號」開頭的行（如 圖 3-5、表2-1），「表示」「圖面」等一般文句不算；彩色關鍵字另可比對 40 字內短行；英文關鍵字（GPS、GNSS）須為獨立單字；含「無」「未提供」等否定語的片段不比對；目錄頁不套用。"
   )
