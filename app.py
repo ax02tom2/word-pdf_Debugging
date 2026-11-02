@@ -291,8 +291,7 @@ def decide_page_color(ev, t_raw):
   """回傳 (是否彩色, 規則, 原因, 彩色關鍵字, 黑白關鍵字)。
 
   判定順序（由上而下，命中即停）：
-    1. 圖表標題含「彩色關鍵字」→ 彩色
-    2. 短行含「彩色關鍵字」且頁面有少量實質彩色 → 彩色
+    1~2. 標題／短行含「彩色關鍵字」，且頁面有實質彩色圖片／圖形 → 彩色（無圖頁不算）
     3. 圖表標題含「黑白關鍵字」→ 黑白（同頁有豐富彩色圖片則例外）
     4. 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
   目錄頁略過 1~3。
@@ -303,12 +302,12 @@ def decide_page_color(ev, t_raw):
   # 黑白關鍵字只認「圖／表 x」標題行；圖內座標軸文字（如「日雨量(mm)」）不算。
   bw_short = [] if toc else _title_hits(t_raw, BW_KEYWORDS, caption_only=True)
 
-  if c_cap:
-    return True, "①彩色標題", "圖表標題命中彩色關鍵字", c_short, bw_short
-  if c_short:
+  if c_cap or c_short:
+    # 標題命中只是「值得檢查」；頁面必須真有彩色圖片／圖形才判彩色，無圖頁（純文字、目錄式列舉）不算。
     ok, why, sig = evidence_has_color(ev, "lenient")
     if ok:
-      return True, "②標題＋實際彩色", why, c_short, bw_short
+      return True, ("①彩色標題＋實際彩色" if c_cap else "②短行關鍵字＋實際彩色"), why, c_short, bw_short
+    # 沒有彩色證據 → 不採彩色，繼續往下判定（黑白標題或實際色彩）
   if bw_short:
     ok, why, sig = evidence_has_color(ev, "rich")
     if ok:
@@ -360,7 +359,7 @@ if "color_keyword_rules" not in st.session_state:
 
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
   st.markdown(
-      "**判定順序**：①圖表標題含彩色關鍵字 → 彩色　②短行含彩色關鍵字且頁面確有彩色 → 彩色　"
+      "**判定順序**：①②標題或短行含彩色關鍵字，且頁面確有彩色圖片／圖形 → 彩色（無圖頁不算）　"
       "③圖表標題（圖／表 x…）含黑白關鍵字 → 黑白（同頁若有豐富多色圖片則仍判彩色）　"
       "④其餘依實際圖片／向量色彩判定。  \n"
       "彩色關鍵字看圖表標題或短行；黑白關鍵字只認「圖／表」開頭的標題行；目錄頁不套用。"
@@ -540,7 +539,7 @@ if uploaded_file is not None:
       )
       st.info(
           "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
-          "圖表標題含彩色關鍵字（工作進度表、GNSS 等）固定彩色；含黑白關鍵字（雨量、風險矩陣）固定黑白；其餘依實際色彩判定。"
+          "標題含彩色關鍵字（工作進度表、GNSS 等）且頁面有彩色圖形者判彩色；含黑白關鍵字（雨量、風險矩陣）固定黑白；其餘依實際色彩判定。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
         only_hit = st.checkbox("只顯示彩色頁或有關鍵字命中的頁面", value=False, key="diag_filter")
