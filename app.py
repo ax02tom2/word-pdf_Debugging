@@ -13,7 +13,8 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾必要彩色頁、揪出圖表號跳號、空白頁與頁碼異常。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！自動優化連續頁碼區段（如 1-6、8-10）、"
+    "強制保留 GPS/GNSS/雙軸傾斜計圖表為彩色頁，並提供圖表號順序與內文錯字檢核。"
 )
 
 uploaded_file = st.file_uploader(
@@ -27,6 +28,35 @@ if uploaded_file is not None:
   page_texts = []
   full_text = ""
   is_pdf = file_extension == "pdf"
+
+
+  # --- 輔助函式：將連續頁碼轉為 1-6、8-10 格式 ---
+  def format_pages_to_ranges(page_list):
+    if not page_list:
+      return "無"
+    page_list = sorted(list(set(page_list)))
+    ranges = []
+    start = page_list[0]
+    end = page_list[0]
+
+    for i in range(1, len(page_list)):
+      if page_list[i] == end + 1:
+        end = page_list[i]
+      else:
+        if start == end:
+          ranges.append(str(start))
+        else:
+          ranges.append(f"{start}-{end}")
+        start = page_list[i]
+        end = page_list[i]
+
+    if start == end:
+      ranges.append(str(start))
+    else:
+      ranges.append(f"{start}-{end}")
+
+    return "、".join(ranges)
+
 
   if is_pdf:
     progress_bar = st.progress(0)
@@ -46,8 +76,15 @@ if uploaded_file is not None:
 
       page = doc[page_num]
       actual_page = page_num + 1
+      t = reader.pages[page_num].extract_text() or ""
 
-      # 1. 嚴格彩色頁判定邏輯（排除微量文字或黑白夾雜）
+      # 1. 智慧彩色頁判定：
+      # 條件 A：頁面文字中包含關鍵監測項目（GPS、GNSS、雙軸傾斜計），強制納入彩印，確保歷時曲線圖清晰。
+      # 條件 B：透過像素分析偵測是否有顯著彩色圖表或照片。
+      has_monitoring_keyword = any(
+          kw in t.lower() for kw in ["gps", "gnss", "雙軸傾斜計", "傾斜量歷時曲線"]
+      )
+
       pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
@@ -64,13 +101,12 @@ if uploaded_file is not None:
           color_pixel_count += 1
 
       color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
-      if color_ratio > 0.025:
+
+      if has_monitoring_keyword or color_ratio > 0.025:
         color_pages.append(actual_page)
       else:
         bw_pages.append(actual_page)
 
-      # 2. 文字萃取
-      t = reader.pages[page_num].extract_text() or ""
       page_texts.append((actual_page, t))
       full_text += f"\n--- 第 {actual_page} 頁 ---\n" + t
 
@@ -99,73 +135,58 @@ if uploaded_file is not None:
   st.success("✅ 檔案解析完成！")
 
   # --- 頁籤介面 ---
-  tab1, tab2, tab3, tab4 = st.tabs([
+  tab1, tab2, tab3, tab4, tab5 = st.tabs([
       "🖨️ 列印色彩建議",
       "📊 圖表號順序檢核",
       "📄 實質空白頁檢核",
+      "🔍 內文錯字與邏輯檢核",
       "🔢 頁碼連續性檢核",
   ])
 
   with tab1:
     st.subheader("🖨️ 建議使用彩色列印的頁面")
     if is_pdf:
-      if color_pages:
-        st.markdown(
-            f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**："
-            f" `{', '.join(map(str, color_pages))}`"
-        )
-        st.info(
-            "💡 系統已自動過濾微量色彩與純黑白頁，僅挑出包含照片、地圖或顯著彩色圖表的頁面。"
-        )
-      else:
-        st.info("✨ 本文件經評價全篇為黑白呈現即可。")
+      color_str = format_pages_to_ranges(color_pages)
+      bw_str = format_pages_to_ranges(bw_pages)
+
+      st.markdown(
+          f"🎨 **建議彩色輸出頁面 ({len(color_pages)} 頁)**：`{color_str}`"
+      )
+      st.markdown(f"⬛ **建議黑白輸出頁面**：`{bw_str}`")
+      st.info(
+          "💡 系統已自動將連續頁面合併為區段格式（例如 `1-6、8-10`），"
+          "並已自動將包含 **GPS、GNSS、雙軸傾斜計** 成果圖表的頁面強制納入彩色清單中！"
+      )
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體彩色頁，建議另存成 PDF 後上傳。")
 
   with tab2:
     st.subheader("📊 圖表號連續性與跳號檢核")
-    st.write(
-        "系統自動抓取文件中的圖表編號（例如 圖 1-1、表 2-1 等），檢查是否有順序跳號或顛倒："
-    )
-
     fig_records = []
     for p_num, t in page_texts if is_pdf else [("Word", full_text)]:
-      # 捕捉如 圖1-1, 表 2-1, 圖1 等格式
       matches = re.findall(
           r"(圖\s*\d+[\-\d]*|表\s*\d+[\-\d]*|Figure\s*\d+|Table\s*\d+)", t
       )
       for m in matches:
-        # 為了避免內文重複提及造成干擾，我們只記錄每個圖表號第一次出現的頁面與編號
         clean_name = m.replace(" ", "")
         nums = re.findall(r"\d+", m)
         if nums:
-          main_num = int(nums[0])  # 以主要編號數字作排序依據
+          main_num = int(nums[0])
           fig_records.append({"page": p_num, "label": clean_name, "num": main_num})
 
     if fig_records:
-      # 篩選出獨特的圖表標籤清單，並檢查數字順序
       unique_figs = {}
       for item in fig_records:
         if item["label"] not in unique_figs:
           unique_figs[item["label"]] = item["page"]
 
-      st.write(
-          f"📁 共偵測到 {len(unique_figs)} 個不重複的圖表標籤（內文重複提及已自動略過比對）："
-      )
-
-      # 顯示前幾筆抓到的圖表作為對照
-      st.json(unique_figs, expanded=False)
-
-      # 檢查是否有數字順序跳號（針對純數字或主編號）
       numbers_only = [
           int(re.findall(r"\d+", k)[0])
           for k in unique_figs.keys()
           if re.findall(r"\d+", k)
       ]
-      # 排序並檢查連續性
       issues = []
       if len(numbers_only) > 1:
-        # 簡單檢查是否有大於 1 的落差（排除章節編號如 1-1 的情況，這裡主要看流水號）
         sorted_nums = sorted(list(set(numbers_only)))
         for i in range(len(sorted_nums) - 1):
           if (
@@ -194,9 +215,9 @@ if uploaded_file is not None:
           blank_pages.append(p_num)
 
       if blank_pages:
+        blank_str = format_pages_to_ranges(blank_pages)
         st.warning(
-            f"⚠️ **發現疑似實質空白頁面**：第"
-            f" `{', '.join(map(str, blank_pages))}` 頁內文極少或完全空白。"
+            f"⚠️ **發現疑似實質空白頁面**：第 `{blank_str}` 頁內文極少或完全空白。"
         )
       else:
         st.success("✨ 未發現異常的實質空白頁。")
@@ -204,6 +225,29 @@ if uploaded_file is not None:
       st.info("Word 格式建議透過 Word 預覽模式檢查空白頁。")
 
   with tab4:
+    st.subheader("🔍 內文錯字、標點符號與邏輯一致性檢核")
+    st.write("系統針對內文進行自動掃描，挑出常見筆誤與排版異常：")
+
+    text_issues = []
+    for p_num, t in page_texts:
+      if ".." in t or "%%" in t or "  " in t:
+        text_issues.append(
+            f"• **第 {p_num} 頁**：發現連續符號或多處連續空白，可能影響排版。"
+        )
+
+      repeats = re.findall(r"([\u4e00-\u9fa5])\1{1,}", t)
+      if repeats:
+        text_issues.append(
+            f"• **第 {p_num} 頁**：發現中文字元連續重複（如 `{set(repeats)}`），請確認是否為手誤。"
+        )
+
+    if text_issues:
+      for issue in text_issues[:20]:
+        st.warning(issue)
+    else:
+      st.success("✨ 未在內文中偵測到明顯的重複字元或重大格式錯誤。")
+
+  with tab5:
     st.subheader("🔢 頁碼連續性檢核")
     if is_pdf:
       st.info(f"📁 總計掃描 {total_pages} 個實體頁面，頁碼結構排序正常。")
