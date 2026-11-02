@@ -13,8 +13,8 @@ st.set_page_config(
 
 st.title("📑 文件（PDF / Word）智能檢核與列印分析工具")
 st.write(
-    "支援 **PDF** 與 **Word (.docx)** 雙格式！自動優化連續頁碼區段（如 1-6、8-10）、"
-    "強制保留 GPS/GNSS/雙軸傾斜計圖表為彩色頁，並提供圖表號順序與內文錯字檢核。"
+    "支援 **PDF** 與 **Word (.docx)** 雙格式！精準過濾單純黑白表格、"
+    "強制保留 GPS/GNSS/雙軸傾斜計與【立體投影圓分析】相關頁面為彩色，並優化連續頁碼區段（如 1-6、8-10）。"
 )
 
 uploaded_file = st.file_uploader(
@@ -30,7 +30,7 @@ if uploaded_file is not None:
   is_pdf = file_extension == "pdf"
 
 
-  # --- 輔助函式：將連續頁碼轉為 1-6、8-10 格式 ---
+  # --- 輔助函式：將連續頁碼轉為 1-6、8-10 格式，並以頓號分隔 ---
   def format_pages_to_ranges(page_list):
     if not page_list:
       return "無"
@@ -77,14 +77,21 @@ if uploaded_file is not None:
       page = doc[page_num]
       actual_page = page_num + 1
       t = reader.pages[page_num].extract_text() or ""
+      t_lower = t.lower()
 
-      # 1. 智慧彩色頁判定：
-      # 條件 A：頁面文字中包含關鍵監測項目（GPS、GNSS、雙軸傾斜計），強制納入彩印，確保歷時曲線圖清晰。
-      # 條件 B：透過像素分析偵測是否有顯著彩色圖表或照片。
-      has_monitoring_keyword = any(
-          kw in t.lower() for kw in ["gps", "gnss", "雙軸傾斜計", "傾斜量歷時曲線"]
-      )
+      # 1. 強制彩印的關鍵字（包含 GPS, GNSS, 雙軸傾斜計, 以及立體投影圓分析相關）
+      forced_color_keywords = [
+          "gps",
+          "gnss",
+          "雙軸傾斜計",
+          "傾斜量歷時曲線",
+          "立體投影圓分析",
+          "立體投影圓",
+          "位態",
+      ]
+      has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
+      # 2. 像素色彩分析
       pix = page.get_pixmap(dpi=75)
       samples = pix.samples
       color_pixel_count = 0
@@ -102,7 +109,10 @@ if uploaded_file is not None:
 
       color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
 
-      if has_monitoring_keyword or color_ratio > 0.025:
+      # 3. 綜合判定邏輯：
+      # - 若包含指定關鍵字（如立體投影圓分析、GPS等）或是顯著彩色圖像（比例大於 3%），判為彩色頁。
+      # - 若是單純表格或純黑白文字頁（即使有微量色塊雜訊），一律歸類為黑白頁。
+      if has_forced_keyword or color_ratio > 0.03:
         color_pages.append(actual_page)
       else:
         bw_pages.append(actual_page)
@@ -154,8 +164,8 @@ if uploaded_file is not None:
       )
       st.markdown(f"⬛ **建議黑白輸出頁面**：`{bw_str}`")
       st.info(
-          "💡 系統已自動將連續頁面合併為區段格式（例如 `1-6、8-10`），"
-          "並已自動將包含 **GPS、GNSS、雙軸傾斜計** 成果圖表的頁面強制納入彩色清單中！"
+          "💡 系統已自動排除單純黑白表格頁面，並強制將包含 **GPS、GNSS、雙軸傾斜計**"
+          " 以及 **立體投影圓分析 / 位態** 相關的成果頁面納入彩印清單中，頁碼區段已自動以頓號（`、`）區隔！"
       )
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體彩色頁，建議另存成 PDF 後上傳。")
