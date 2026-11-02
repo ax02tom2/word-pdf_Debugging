@@ -33,8 +33,9 @@ def _color_signature(image):
     mx, mn = max(r, g, b), min(r, g, b)
     chroma = mx - mn
     sat = chroma / mx if mx else 0.0
-    # 淡灰、淺灰及大部分淺綠表格網底在此排除；不以「是否接近白色」單獨判斷。
-    if chroma >= 24 and sat >= 0.13 and mx < 253:
+    # 灰色及低彩度淺綠表格網底不視為彩色；提高彩度門檻，
+    # 但保留照片、空拍影像及彩色圖表中的實質色彩。
+    if chroma >= 30 and sat >= 0.18 and mx < 253:
       chromatic += 1
       h = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0]
       hues.add(int(h * 12) % 12)
@@ -167,17 +168,15 @@ if uploaded_file is not None:
       page_area = width * height
       is_a3 = page_area > 600000  # A3 面積門檻判斷
 
-      # 2. 強制彩印的關鍵字（工作進度表、GPS、GNSS、雙軸傾斜計、立體投影圓分析相關）
+      # 2. 強制彩印只保留明確指向彩色圖表/成果的詞組。
+      # GPS、GNSS、雙軸傾斜計等設備或一般文字本身不代表需要彩印。
       forced_color_keywords = [
           "工作進度表",
           "進度表",
-          "gps",
-          "gnss",
-          "雙軸傾斜計",
           "傾斜量歷時曲線",
           "立體投影圓分析",
           "立體投影圓",
-          "位態",
+          "位態分析",
       ]
       has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
@@ -244,8 +243,9 @@ if uploaded_file is not None:
           f"🎨 **本文 A4 彩色頁 ({len(a4_color_pages)} 頁)**：`{a4_str}`"
       )
       st.info(
-          "💡 系統已升級過濾演算法，可自動略過帶有淺綠色或灰色背景網底的「純文字/純表格」頁面，"
-          "僅保留 **工作進度表**、**GPS、GNSS、雙軸傾斜計** 與 **立體投影圓分析 / 位態** 相關頁面為彩色！"
+          "💡 系統會略過灰色及低彩度淺綠色表格網底；GPS、GNSS、雙軸傾斜計等一般文字不會單獨觸發彩印。"
+          "明確的工作進度表、傾斜量歷時曲線、立體投影圓分析等頁面仍可依關鍵字判定，"
+          "A3/A4 的實質彩色圖片亦會獨立辨識。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認 A3 漏判時使用）"):
         for pg, size, reason, forced_color, forced_bw in color_diagnostics:
