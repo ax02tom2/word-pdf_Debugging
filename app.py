@@ -89,8 +89,8 @@ def _color_rule_ok(sig, level="normal"):
   if level == "strict":
     return ratio >= 0.018 and hue_count >= 4 and color_count >= 24 and dominant_hue_share <= 0.86
   if level == "rich":
-    # 黑白標題頁的例外：必須是色相與色階都很豐富的照片／成果圖，雨量藍紅線與紅黃綠矩陣色塊達不到。
-    return ratio >= 0.02 and hue_count >= 4 and color_count >= 80
+    # 黑白標題頁的例外：必須是色相（≥3）與色階（≥50）都豐富的照片／成果圖；雨量藍紅線（約2色相）與紅黃綠矩陣色塊（色階少）達不到。
+    return ratio >= 0.01 and hue_count >= 3 and color_count >= 50
   if level == "lenient":
     return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
   big = ratio >= 0.015 and color_count >= 10 and (hue_count >= 3 or ratio >= 0.05)
@@ -272,18 +272,46 @@ def _looks_like_toc(text):
   return len(leaders) >= 3 or any(k in text[:200] for k in ("目錄", "目次"))
 
 
+# 圖表標題必須是「圖／表 ＋ 編號」開頭（圖 3-5、表2.1、Figure 4、附圖 1），
+# 因此「表示」「圖面」「表格」「圖形」等一般文句不會被當成標題。
+CAPTION_RE = re.compile(
+    r"^(?:附)?(?:圖|表|figure|fig\.?|table)\s*[0-9一二三四五六七八九十]+(?:[\-.][0-9]+)*"
+)
+NEGATION_RE = re.compile(r"(?:無|沒有|未含|未繪製|未提供|不含)[^，。；;,.]{0,6}")
+
+
+def _norm_line(line):
+  return re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
+
+
+def _kw_in(text, kw):
+  """英文關鍵字（gps、gnss）要求獨立單字，中文關鍵字為子字串比對。"""
+  if kw.isascii():
+    return re.search(rf"(?<![a-z]){re.escape(kw)}(?![a-z])", text) is not None
+  return kw in text
+
+
 def _title_hits(raw_text, keywords, caption_only=False):
-  """只計入出現在短行（<=40 字）的關鍵字；caption_only 時須為「圖／表 x」開頭的標題行。"""
+  """比對圖表標題或短行中的關鍵字。
+  caption_only：須為「圖／表＋編號」開頭的標題行（編號與圖名被拆成兩行時會合併）；
+  否則為 40 字內的短行。標題中「無雨量圖」這類否定語會先移除。"""
+  lines = [l for l in raw_text.splitlines() if l.strip()]
   hits = set()
-  for line in raw_text.splitlines():
-    n = re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
-    if not 0 < len(n) <= 60:
+  for i, line in enumerate(lines):
+    n = _norm_line(line)
+    if caption_only:
+      m = CAPTION_RE.match(n)
+      if not m:
+        continue
+      # 只有編號、圖名在下一行時，把下一行併入。
+      if len(n) - m.end() <= 1 and i + 1 < len(lines):
+        n += _norm_line(lines[i + 1])
+      if len(n) > 80:
+        continue
+    elif not 0 < len(n) <= 40:
       continue
-    if caption_only and not re.match(r"^(圖|表|figure|table)", n):
-      continue
-    if not caption_only and len(n) > 40:
-      continue
-    hits.update(kw for kw in keywords if kw in n)
+    n = NEGATION_RE.sub("", n)
+    hits.update(kw for kw in keywords if _kw_in(n, kw))
   return sorted(hits)
 
 
@@ -312,7 +340,8 @@ def decide_page_color(ev, t_raw):
     ok, why, sig = evidence_has_color(ev, "rich")
     if ok:
       return True, "③黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
-    return False, "③黑白標題", "圖表標題命中黑白關鍵字", c_short, bw_short
+    detail = f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}，需占比≥0.010、色相≥3、色階≥50 才例外判彩色］" if sig else "［無圖片／渲染特徵］"
+    return False, "③黑白標題", "圖表標題命中黑白關鍵字" + detail, c_short, bw_short
 
   has_color, reason, sig = evidence_has_color(ev, "normal")
   if sig:
@@ -362,7 +391,7 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
       "**判定順序**：①②標題或短行含彩色關鍵字，且頁面確有彩色圖片／圖形 → 彩色（無圖頁不算）　"
       "③圖表標題（圖／表 x…）含黑白關鍵字 → 黑白（同頁若有豐富多色圖片則仍判彩色）　"
       "④其餘依實際圖片／向量色彩判定。  \n"
-      "彩色關鍵字看圖表標題或短行；黑白關鍵字只認「圖／表」開頭的標題行；目錄頁不套用。"
+      "標題＝「圖／表＋編號」開頭的行（如 圖 3-5、表2-1），「表示」「圖面」等一般文句不算；彩色關鍵字另可比對 40 字內短行；英文關鍵字（GPS、GNSS）須為獨立單字；含「無」「未提供」等否定語的片段不比對；目錄頁不套用。"
   )
   # 匯入備份：必須在文字框建立之前處理
   imported = st.file_uploader("匯入先前備份的規則（.json）", type=["json"], key="rules_import")
@@ -386,6 +415,10 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
     bw_keyword_text = st.text_area(
         "⬛ 黑白關鍵字：雨量、風險矩陣等（每行一項）", height=260, key="bw_keyword_rules"
     )
+  _short_kw = [k for k in _parse_keyword_lines(color_keyword_text) + _parse_keyword_lines(bw_keyword_text)
+               if not k.isascii() and len(k) <= 2]
+  if _short_kw:
+    st.warning("⚠️ 以下關鍵字只有 2 字以內，容易誤判，建議改成較完整的圖表名稱：" + "、".join(_short_kw))
   b1, b2, b3 = st.columns(3)
   b1.button("💾 儲存規則", on_click=_save_rules, use_container_width=True)
   b2.button("↩️ 還原預設", on_click=_reset_rules, use_container_width=True)
