@@ -1,5 +1,8 @@
 import io
 import re
+import colorsys
+from collections import Counter
+from PIL import Image
 import fitz  # PyMuPDF
 import pypdf
 import streamlit as st
@@ -16,6 +19,84 @@ st.write(
     "支援 **PDF** 與 **Word (.docx)** 雙格式！自動區分 **A3/A4 尺寸**、精準排除純文字與純背景色表格、"
     "僅保留**真正的彩色圖表/進度表/立體投影圓分析**相關頁面為彩色，並以頓號與區段格式呈現。"
 )
+
+def _color_signature(image):
+  """回傳色彩比例、色相種類及量化色彩種類；不把低彩度網底當成彩色。"""
+  image = image.convert("RGB")
+  image.thumbnail((900, 900))
+  pixels = list(image.getdata())
+  total = max(len(pixels), 1)
+  chromatic = 0
+  hues = set()
+  colors = set()
+  for r, g, b in pixels:
+    mx, mn = max(r, g, b), min(r, g, b)
+    chroma = mx - mn
+    sat = chroma / mx if mx else 0.0
+    # 淡灰、淺灰及大部分淺綠表格網底在此排除；不以「是否接近白色」單獨判斷。
+    if chroma >= 24 and sat >= 0.13 and mx < 253:
+      chromatic += 1
+      h = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0]
+      hues.add(int(h * 12) % 12)
+      colors.add((r // 32, g // 32, b // 32))
+  return chromatic / total, len(hues), len(colors)
+
+
+def _is_real_color_image(image):
+  ratio, hue_count, color_count = _color_signature(image)
+  # 彩色照片/空拍/成果影像通常有較豐富的色相或色彩組合；單一淡色表格網底不會通過。
+  return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
+
+
+def page_has_real_color(page):
+  """先逐張檢查嵌入圖片，再檢查整頁；避免固定像素步長漏掉 A3 圖片及細線。"""
+  # 1) 嵌入式點陣圖：獨立分析，不讓 A3 大白邊稀釋彩色比例。
+  seen = set()
+  for info in page.get_images(full=True):
+    xref = info[0]
+    if xref in seen:
+      continue
+    seen.add(xref)
+    try:
+      pix = fitz.Pixmap(page.parent, xref)
+      if pix.n - pix.alpha > 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+      elif pix.colorspace and pix.colorspace.n != 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+      if pix.width * pix.height < 400:
+        continue
+      mode = "RGBA" if pix.alpha else "RGB"
+      img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+      if _is_real_color_image(img):
+        return True, "嵌入圖片含實質彩色"
+    except Exception:
+      # 個別特殊色彩空間圖片無法解碼時，仍由整頁渲染分析接手。
+      pass
+
+  # 2) 整頁渲染：使用完整縮圖，不採固定 bytes 間距取樣，避免細線/局部影像被跳過。
+  pix = page.get_pixmap(dpi=120, colorspace=fitz.csRGB, alpha=False)
+  img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+  ratio, hue_count, color_count = _color_signature(img)
+  # 整頁的門檻略高，避免多個淡色表格儲存格累積成彩色頁。
+  if ratio >= 0.009 and (hue_count >= 3 or color_count >= 28):
+    return True, "整頁含多色彩色內容"
+
+  # 3) 向量圖表顏色：PDF drawing 的填色/線色可補足細小曲線被縮圖稀釋的情況。
+  drawing_colors = set()
+  try:
+    for item in page.get_drawings():
+      for key in ("color", "fill"):
+        c = item.get(key)
+        if c and len(c) >= 3:
+          r, g, b = c[:3]
+          if max(r, g, b) - min(r, g, b) >= 0.16:
+            drawing_colors.add(tuple(round(v * 15) for v in (r, g, b)))
+  except Exception:
+    pass
+  if len(drawing_colors) >= 3:
+    return True, "向量圖表含多種顏色"
+  return False, "未達實質彩色門檻"
+
 
 uploaded_file = st.file_uploader(
     "請選擇您的文件檔案", type=["pdf", "docx"], accept_multiple_files=False
@@ -66,6 +147,7 @@ if uploaded_file is not None:
     total_pages = len(doc)
     a4_color_pages = []
     a3_color_pages = []
+    color_diagnostics = []
 
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
 
@@ -85,7 +167,7 @@ if uploaded_file is not None:
       page_area = width * height
       is_a3 = page_area > 600000  # A3 面積門檻判斷
 
-      # 2. 強制彩印 / 強制黑白關鍵字
+      # 2. 強制彩印的關鍵字（工作進度表、GPS、GNSS、雙軸傾斜計、立體投影圓分析相關）
       forced_color_keywords = [
           "工作進度表",
           "進度表",
@@ -97,42 +179,15 @@ if uploaded_file is not None:
           "立體投影圓",
           "位態",
       ]
-      # 規格：雨量 / 降雨相關頁面一律優先判定為黑白，不受像素或彩印關鍵字影響
-      forced_bw_keywords = ["雨量", "降雨"]
-      has_forced_bw_keyword = any(kw in t_lower for kw in forced_bw_keywords)
-      has_forced_keyword = (
-          not has_forced_bw_keyword
-          and any(kw in t_lower for kw in forced_color_keywords)
-      )
+      has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
-      # 3. 嚴格排除表格網底的像素色彩分析
-      # 淺綠、灰色、米色等低彩度底色不應視為真正彩色內容。
-      # 以色度差 (max-min) + HSV 近似飽和度雙門檻判斷，並排除接近白色的淡色網底。
-      pix = page.get_pixmap(dpi=90, colorspace=fitz.csRGB, alpha=False)
-      samples = pix.samples
-      color_pixel_count = 0
-      total_sampled = 0
-
-      # 每 8 個像素取樣一次，降低運算量並減少固定步長過大造成的漏判
-      for i in range(0, len(samples) - 2, 24):
-        total_sampled += 1
-        r, g, b = int(samples[i]), int(samples[i + 1]), int(samples[i + 2])
-        max_rgb = max(r, g, b)
-        min_rgb = min(r, g, b)
-        chroma = max_rgb - min_rgb
-        saturation = chroma / max_rgb if max_rgb > 0 else 0.0
-
-        # 必須同時具有明顯色度與飽和度。
-        # 這可排除一般灰階、淺灰底、淡綠底及大部分低彩度表格網底。
-        # 接近白色的微弱色偏也不列入；深色/鮮明圖表線條仍可保留。
-        if chroma >= 55 and saturation >= 0.25 and max_rgb < 250:
-          color_pixel_count += 1
-
-      color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
+      # 3. 分析真正彩色內容：淡色表格網底不單獨構成彩色頁；嵌入圖片獨立判讀。
+      has_real_color, color_reason = page_has_real_color(page)
+      color_diagnostics.append((actual_page, "A3" if is_a3 else "A4", color_reason, has_forced_keyword, has_forced_bw_keyword))
 
       # 4. 綜合判定彩色頁與尺寸分流
       # 必須包含強制關鍵字，或是真正的彩色圖像比例超過 1.5%，才判定為彩色頁
-      if not has_forced_bw_keyword and (has_forced_keyword or color_ratio > 0.015):
+      if has_forced_keyword or color_ratio > 0.015:
         if is_a3:
           a3_color_pages.append(actual_page)
         else:
@@ -166,11 +221,10 @@ if uploaded_file is not None:
   st.success("✅ 檔案解析完成！")
 
   # --- 頁籤介面 ---
-  tab1, tab2, tab3, tab4, tab5 = st.tabs([
+  tab1, tab2, tab3, tab4 = st.tabs([
       "🖨️ 列印色彩建議",
       "📊 圖表號順序檢核",
       "📄 實質空白頁檢核",
-      "🔍 內文錯字與邏輯檢核",
       "🔢 頁碼連續性檢核",
   ])
 
@@ -190,6 +244,9 @@ if uploaded_file is not None:
           "💡 系統已升級過濾演算法，可自動略過帶有淺綠色或灰色背景網底的「純文字/純表格」頁面，"
           "僅保留 **工作進度表**、**GPS、GNSS、雙軸傾斜計** 與 **立體投影圓分析 / 位態** 相關頁面為彩色！"
       )
+      with st.expander("查看逐頁彩色判定診斷（確認 A3 漏判時使用）"):
+        for pg, size, reason, forced_color, forced_bw in color_diagnostics:
+          st.write(f"第 {pg} 頁（{size}）：{reason}；強制彩印關鍵字={forced_color}；強制黑白關鍵字={forced_bw}")
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
 
@@ -258,29 +315,6 @@ if uploaded_file is not None:
       st.info("Word 格式建議透過 Word 預覽模式檢查空白頁。")
 
   with tab4:
-    st.subheader("🔍 內文錯字、標點符號與邏輯一致性檢核")
-    st.write("系統針對內文進行自動掃描，挑出常見筆誤與排版異常：")
-
-    text_issues = []
-    for p_num, t in page_texts:
-      if ".." in t or "%%" in t or "  " in t:
-        text_issues.append(
-            f"• **第 {p_num} 頁**：發現連續符號或多處連續空白，可能影響排版。"
-        )
-
-      repeats = re.findall(r"([\u4e00-\u9fa5])\1{1,}", t)
-      if repeats:
-        text_issues.append(
-            f"• **第 {p_num} 頁**：發現中文字元連續重複（如 `{set(repeats)}`），請確認是否為手誤。"
-        )
-
-    if text_issues:
-      for issue in text_issues[:20]:
-        st.warning(issue)
-    else:
-      st.success("✨ 未在內文中偵測到明顯的重複字元或重大格式錯誤。")
-
-  with tab5:
     st.subheader("🔢 頁碼連續性檢核")
     if is_pdf:
       st.info(f"📁 總計掃描 {total_pages} 個實體頁面，頁碼結構排序正常。")
