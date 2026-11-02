@@ -20,21 +20,26 @@ st.write(
     "僅保留**真正的彩色圖表/進度表/立體投影圓分析**相關頁面為彩色，並以頓號與區段格式呈現。"
 )
 
-def _color_signature(image):
-  """回傳色彩比例、色相種類及量化色彩種類；不把低彩度網底當成彩色。"""
+def _color_signature(image, ignore_mask=None):
+  """計算非文字區域的實質彩色比例，避免彩色字體/超連結單獨觸發。"""
   image = image.convert("RGB")
+  original_size = image.size
   image.thumbnail((900, 900))
+  if ignore_mask is not None:
+    ignore_mask = ignore_mask.resize(image.size, Image.Resampling.NEAREST)
   pixels = list(image.getdata())
-  total = max(len(pixels), 1)
+  ignored = list(ignore_mask.getdata()) if ignore_mask is not None else None
+  total = max(len(pixels) - (sum(1 for v in ignored if v) if ignored else 0), 1)
   chromatic = 0
   hues = set()
   colors = set()
-  for r, g, b in pixels:
+  for i, (r, g, b) in enumerate(pixels):
+    if ignored is not None and ignored[i]:
+      continue
     mx, mn = max(r, g, b), min(r, g, b)
     chroma = mx - mn
     sat = chroma / mx if mx else 0.0
-    # 灰色及低彩度淺綠表格網底不視為彩色；提高彩度門檻，
-    # 但保留照片、空拍影像及彩色圖表中的實質色彩。
+    # 灰色、低彩度網底及近白色抗鋸齒像素不列入彩色。
     if chroma >= 30 and sat >= 0.18 and mx < 253:
       chromatic += 1
       h = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)[0]
@@ -45,58 +50,112 @@ def _color_signature(image):
 
 def _is_real_color_image(image):
   ratio, hue_count, color_count = _color_signature(image)
-  # 彩色照片/空拍/成果影像通常有較豐富的色相或色彩組合；單一淡色表格網底不會通過。
   return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
 
 
+def _text_ignore_mask(page, pix):
+  """建立 PDF 文字區域遮罩；文字顏色不單獨作為整頁彩色證據。"""
+  scale_x = pix.width / max(page.rect.width, 1)
+  scale_y = pix.height / max(page.rect.height, 1)
+  mask = Image.new("L", (pix.width, pix.height), 0)
+  from PIL import ImageDraw
+  draw = ImageDraw.Draw(mask)
+  try:
+    data = page.get_text("dict")
+    for block in data.get("blocks", []):
+      for line in block.get("lines", []):
+        for span in line.get("spans", []):
+          x0, y0, x1, y1 = span.get("bbox", (0, 0, 0, 0))
+          # 僅遮文字字框，保留相鄰的圖表線條及底圖。
+          pad = 1.2
+          box = (
+              int((x0 - page.rect.x0 - pad) * scale_x),
+              int((y0 - page.rect.y0 - pad) * scale_y),
+              int((x1 - page.rect.x0 + pad) * scale_x),
+              int((y1 - page.rect.y0 + pad) * scale_y),
+          )
+          draw.rectangle(box, fill=255)
+  except Exception:
+    # 無法取得文字框時不套用遮罩，避免影響原有圖片辨識。
+    return None
+  return mask
+
+
+def _has_substantial_colored_vectors(page):
+  """向量彩色判斷須具備足夠圖形規模，排除零星彩色符號/裝飾線。"""
+  colors = set()
+  colored_count = 0
+  covered_area = 0.0
+  line_extent = 0.0
+  page_area = max(page.rect.width * page.rect.height, 1.0)
+  page_diagonal = max((page.rect.width ** 2 + page.rect.height ** 2) ** 0.5, 1.0)
+  try:
+    for item in page.get_drawings():
+      color_found = False
+      for key in ("color", "fill"):
+        c = item.get(key)
+        if c and len(c) >= 3 and max(c[:3]) - min(c[:3]) >= 0.16:
+          colors.add(tuple(round(v * 15) for v in c[:3]))
+          color_found = True
+      if not color_found:
+        continue
+      rect = item.get("rect")
+      if rect:
+        w, h = max(rect.width, 0), max(rect.height, 0)
+        covered_area += w * h
+        # 細長線段以長度累積，避免面積接近零而漏判彩色線圖。
+        line_extent += max(w, h)
+      colored_count += 1
+  except Exception:
+    return False
+  return (
+      len(colors) >= 3
+      and colored_count >= 4
+      and (covered_area / page_area >= 0.0025 or line_extent / page_diagonal >= 0.12)
+  )
+
+
 def page_has_real_color(page):
-  """先逐張檢查嵌入圖片，再檢查整頁；避免固定像素步長漏掉 A3 圖片及細線。"""
-  # 1) 嵌入式點陣圖：獨立分析，不讓 A3 大白邊稀釋彩色比例。
+  """辨識實質彩色圖片/圖形；排除文字色彩與零星向量裝飾。"""
+  # 1) 嵌入圖片：需有足夠的實際頁面佔比，避免小型彩色 Logo/圖示觸發整頁彩印。
   seen = set()
+  page_area = max(page.rect.width * page.rect.height, 1.0)
   for info in page.get_images(full=True):
     xref = info[0]
     if xref in seen:
       continue
     seen.add(xref)
     try:
+      placements = page.get_image_rects(xref)
+      largest_placement = max(
+          (r.width * r.height / page_area for r in placements), default=0
+      )
+      if largest_placement < 0.004:
+        continue
       pix = fitz.Pixmap(page.parent, xref)
-      if pix.n - pix.alpha > 3:
-        pix = fitz.Pixmap(fitz.csRGB, pix)
-      elif pix.colorspace and pix.colorspace.n != 3:
+      if pix.n - pix.alpha > 3 or (pix.colorspace and pix.colorspace.n != 3):
         pix = fitz.Pixmap(fitz.csRGB, pix)
       if pix.width * pix.height < 400:
         continue
       mode = "RGBA" if pix.alpha else "RGB"
       img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
       if _is_real_color_image(img):
-        return True, "嵌入圖片含實質彩色"
+        return True, "嵌入圖片含實質彩色且版面佔比足夠"
     except Exception:
-      # 個別特殊色彩空間圖片無法解碼時，仍由整頁渲染分析接手。
       pass
 
-  # 2) 整頁渲染：使用完整縮圖，不採固定 bytes 間距取樣，避免細線/局部影像被跳過。
+  # 2) 整頁渲染：遮除 PDF 文字區域後再計算，避免彩色文字/超連結誤判。
   pix = page.get_pixmap(dpi=120, colorspace=fitz.csRGB, alpha=False)
   img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-  ratio, hue_count, color_count = _color_signature(img)
-  # 整頁的門檻略高，避免多個淡色表格儲存格累積成彩色頁。
+  text_mask = _text_ignore_mask(page, pix)
+  ratio, hue_count, color_count = _color_signature(img, text_mask)
   if ratio >= 0.009 and (hue_count >= 3 or color_count >= 28):
-    return True, "整頁含多色彩色內容"
+    return True, "非文字區域含實質多色內容"
 
-  # 3) 向量圖表顏色：PDF drawing 的填色/線色可補足細小曲線被縮圖稀釋的情況。
-  drawing_colors = set()
-  try:
-    for item in page.get_drawings():
-      for key in ("color", "fill"):
-        c = item.get(key)
-        if c and len(c) >= 3:
-          r, g, b = c[:3]
-          if max(r, g, b) - min(r, g, b) >= 0.16:
-            drawing_colors.add(tuple(round(v * 15) for v in (r, g, b)))
-  except Exception:
-    pass
-  if len(drawing_colors) >= 3:
-    return True, "向量圖表含多種顏色"
-  return False, "未達實質彩色門檻"
+  # 3) 向量圖形：須有多種顏色及足夠的圖形規模，不再以顏色種類單獨觸發。
+  if _has_substantial_colored_vectors(page):
+    return True, "向量彩色圖形達實質面積/線段門檻"
+  return False, "未偵測到實質彩色圖片或圖形（文字與零星裝飾已排除）"
 
 
 uploaded_file = st.file_uploader(
@@ -180,16 +239,16 @@ if uploaded_file is not None:
       ]
       has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
-      # 雨量／降雨頁面優先強制黑白；即使同頁含有其他彩色元素，也不列入彩印清單。
+      # 雨量／降雨屬黑白限制提示，不可覆蓋同頁其他實質彩色內容。
       forced_bw_keywords = ["雨量", "降雨"]
       has_forced_bw_keyword = any(kw in t_lower for kw in forced_bw_keywords)
 
-      # 3. 分析真正彩色內容：淡色表格網底不單獨構成彩色頁；嵌入圖片獨立判讀。
+      # 3. 實質彩色證據優先；關鍵字只作診斷提示，不可單靠文字強制整頁彩印。
       has_real_color, color_reason = page_has_real_color(page)
       color_diagnostics.append((actual_page, "A3" if is_a3 else "A4", color_reason, has_forced_keyword, has_forced_bw_keyword))
 
-      # 4. 綜合判定彩色頁與尺寸分流。強制黑白優先，其次才套用強制彩印或影像辨識。
-      if (not has_forced_bw_keyword) and (has_forced_keyword or has_real_color):
+      # 4. 優先順序：實質彩色內容 > 黑白限制。只有未偵測到實質彩色時，雨量頁才維持黑白。
+      if has_real_color:
         if is_a3:
           a3_color_pages.append(actual_page)
         else:
@@ -243,13 +302,14 @@ if uploaded_file is not None:
           f"🎨 **本文 A4 彩色頁 ({len(a4_color_pages)} 頁)**：`{a4_str}`"
       )
       st.info(
-          "💡 系統會略過灰色及低彩度淺綠色表格網底；GPS、GNSS、雙軸傾斜計等一般文字不會單獨觸發彩印。"
-          "明確的工作進度表、傾斜量歷時曲線、立體投影圓分析等頁面仍可依關鍵字判定，"
-          "A3/A4 的實質彩色圖片亦會獨立辨識。"
+          "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
+          "同頁若同時出現雨量/降雨文字與其他實質彩色圖片或圖形，採彩色優先；"
+          "只有未偵測到實質彩色內容的雨量/降雨頁才維持黑白。關鍵字僅作診斷提示，不會單獨強制整頁彩印。"
       )
-      with st.expander("查看逐頁彩色判定診斷（確認 A3 漏判時使用）"):
+      with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
         for pg, size, reason, forced_color, forced_bw in color_diagnostics:
-          st.write(f"第 {pg} 頁（{size}）：{reason}；強制彩印關鍵字={forced_color}；強制黑白關鍵字={forced_bw}")
+          decision = "彩色優先" if "實質彩色" in reason or "向量彩色" in reason or "嵌入圖片" in reason or "非文字區域" in reason else ("黑白限制（未偵測到其他彩色內容）" if forced_bw else "黑白")
+          st.write(f"第 {pg} 頁（{size}）：{decision}；{reason}；彩色關鍵字提示={forced_color}；雨量/降雨黑白提示={forced_bw}")
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
 
