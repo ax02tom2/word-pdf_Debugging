@@ -87,7 +87,10 @@ def _color_rule_ok(sig, level="normal"):
     return ratio >= 0.018 and hue_count >= 4 and color_count >= 24 and dominant_hue_share <= 0.86
   if level == "lenient":
     return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
-  return ratio >= 0.015 and color_count >= 10 and (hue_count >= 3 or ratio >= 0.05)
+  big = ratio >= 0.015 and color_count >= 10 and (hue_count >= 3 or ratio >= 0.05)
+  # 面積占比不大，但色相與色階都很豐富（例如 A3 上的小幅地圖／成果圖）也算彩色。
+  rich = ratio >= 0.004 and hue_count >= 4 and color_count >= 40
+  return big or rich
 
 
 def _is_real_color_image(image, level="normal"):
@@ -240,101 +243,68 @@ def page_has_real_color(page, image_color_cache=None, level="normal"):
   return False, "未偵測到實質彩色圖片或圖形" + note, sig
 
 
-# 雨量規則採「主要圖表為雨量」判定；避免單純提到雨量就把整頁成果圖改成黑白。
+# ── 判定規則（只有兩份關鍵字清單，且只看「圖表標題／短行」，內文敘述提到不算）──
+DEFAULT_COLOR_KEYWORDS = [
+    "工作進度表", "進度表", "傾斜量歷時曲線", "立體投影圓分析", "立體投影圓", "位態分析",
+    "gps", "gnss", "雙軸傾斜計", "變位歷時曲線", "變位歷時",
+]
 DEFAULT_BW_KEYWORDS = [
     "雨量圖", "雨量歷線", "降雨歷線", "降雨量歷線", "雨量柱狀圖",
     "雨量分布圖", "月雨量圖", "日雨量圖", "時雨量圖", "累積雨量圖",
     "雨量統計圖", "歷年雨量圖", "歷年月份雨量圖", "雨量站歷年",
-]
-DEFAULT_RISK_BW_KEYWORDS = [
     "風險等級評估矩陣", "風險評估矩陣", "分數評估矩陣", "風險矩陣", "評估矩陣",
-]
-DEFAULT_FORCE_COLOR_KEYWORDS = [
-    "工作進度表", "進度表", "傾斜量歷時曲線", "立體投影圓分析", "立體投影圓", "位態分析",
-]
-# 這類關鍵字太常出現在一般內文，需頁面同時有少量實質彩色才採彩色。
-DEFAULT_SOFT_COLOR_KEYWORDS = [
-    "gps", "gnss", "雙軸傾斜計", "變位歷時曲線", "變位歷時",
-]
-DEFAULT_COLOR_CONTEXT_KEYWORDS = [
-    "平面圖", "空拍圖", "正射影像", "航照圖", "彩色影像", "地形影像",
-    "崩塌範圍圖", "影響範圍圖", "成果圖", "成果分析圖", "分析成果圖",
-    "分析結果圖", "結果圖", "監測成果圖", "監測結果圖", "成果分析",
-    "變形分析圖", "位移向量圖", "地表變位圖", "流動深度圖", "流速圖",
-    "堆積厚度圖",
 ]
 
 
 def _looks_like_toc(text):
-  """目錄頁（工作進度表 ........ 12）不應因標題關鍵字被強制彩色。"""
+  """目錄頁（工作進度表 ........ 12）不套用標題規則。"""
   leaders = re.findall(r"[.．…·‧⋯]{3,}\s*\d+\s*$", text, flags=re.M)
   return len(leaders) >= 3 or any(k in text[:200] for k in ("目錄", "目次"))
 
 
-def _short_line_hits(raw_text, keywords, max_len=40):
-  """只計入出現在「短行」（圖表標題／圖說）的關鍵字，內文敘述中提到不算。"""
+def _title_hits(raw_text, keywords, caption_only=False):
+  """只計入出現在短行（<=40 字）的關鍵字；caption_only 時須為「圖／表 x」開頭的標題行。"""
   hits = set()
   for line in raw_text.splitlines():
     n = re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
-    if 0 < len(n) <= max_len:
-      hits.update(kw for kw in keywords if kw in n)
+    if not 0 < len(n) <= 60:
+      continue
+    if caption_only and not re.match(r"^(圖|表|figure|table)", n):
+      continue
+    if not caption_only and len(n) > 40:
+      continue
+    hits.update(kw for kw in keywords if kw in n)
   return sorted(hits)
 
 
-def _caption_hits(raw_text, keywords):
-  """關鍵字出現在「圖 x／表 x」開頭的圖表標題行才算。"""
-  hits = set()
-  for line in raw_text.splitlines():
-    n = re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
-    if 0 < len(n) <= 60 and re.match(r"^(圖|表|figure|table)", n):
-      hits.update(kw for kw in keywords if kw in n)
-  return sorted(hits)
+def decide_page_color(page, t_raw, image_cache):
+  """回傳 (是否彩色, 規則, 原因, 彩色關鍵字, 黑白關鍵字)。
 
+  判定順序（由上而下，命中即停）：
+    1. 圖表標題含「彩色關鍵字」→ 彩色
+    2. 短行含「彩色關鍵字」且頁面有少量實質彩色 → 彩色
+    3. 短行含「黑白關鍵字」→ 黑白
+    4. 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
+  目錄頁略過 1~3。
+  """
+  toc = _looks_like_toc(t_raw)
+  c_cap = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS, caption_only=True)
+  c_short = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS)
+  bw_short = [] if toc else _title_hits(t_raw, BW_KEYWORDS)
 
-def decide_page_color(page, t_rule, t_raw, image_cache):
-  """回傳 (是否彩色, 原因, 診斷用命中關鍵字 dict)。"""
-  force_hits = [kw for kw in FORCE_COLOR_KEYWORDS if kw in t_rule]
-  soft_hits = [kw for kw in SOFT_COLOR_KEYWORDS if kw in t_rule]
-  rain_rule_text = re.sub(r"(?:無|沒有|未含|未繪製|未提供)雨量圖(?:表)?", "", t_rule)
-  rain_hits = [kw for kw in BW_KEYWORDS if kw in rain_rule_text]
-  risk_hits = [kw for kw in RISK_BW_KEYWORDS if kw in t_rule]
-  ctx_hits = [kw for kw in COLOR_CONTEXT_KEYWORDS if kw in t_rule]
-  hits = dict(force=force_hits, soft=soft_hits, rain=rain_hits, risk=risk_hits, ctx=ctx_hits)
-
-  if risk_hits:
-    return False, "風險矩陣：依規則強制黑白", hits
-  title_force = _short_line_hits(t_raw, FORCE_COLOR_KEYWORDS)
-  if title_force and not _looks_like_toc(t_raw):
-    # 標題命中仍需頁面有少量實質彩色佐證，純文字頁不會因內文提到而變彩色。
+  if c_cap:
+    return True, "①彩色標題", "圖表標題命中彩色關鍵字", c_short, bw_short
+  if c_short:
     ok, why, sig = page_has_real_color(page, image_cache, level="lenient")
     if ok:
-      return True, "工作進度表／投影圓等標題＋實質彩色：判定彩色", hits
-    return False, "標題命中但頁面無實質彩色：" + why, hits
+      return True, "②標題＋實際彩色", why, c_short, bw_short
+  if bw_short:
+    return False, "③黑白標題", "圖表標題命中黑白關鍵字", c_short, bw_short
 
-  # GNSS／GPS／雙軸傾斜計等：圖表標題（圖 x-x …）命中直接彩色；一般短行命中則需有實質彩色佐證。
-  # 此規則優先於雨量，避免內文提到降雨就把整頁 GNSS 圖壓成黑白。
-  if _caption_hits(t_raw, SOFT_COLOR_KEYWORDS) and not _looks_like_toc(t_raw):
-    return True, "GNSS／GPS／傾斜計圖表標題：依規則強制彩色", hits
-  if _short_line_hits(t_raw, SOFT_COLOR_KEYWORDS) and not _looks_like_toc(t_raw):
-    ok, why, sig = page_has_real_color(page, image_cache, level="lenient")
-    if ok:
-      return True, "GNSS／GPS／傾斜計標題＋實質彩色：判定彩色", hits
-
-  # 雨量黑白只看圖表標題／短行，內文敘述提到「降雨」不算。
-  rain_hits = _short_line_hits(t_raw, BW_KEYWORDS)
-  hits["rain"] = rain_hits
-  if rain_hits and not ctx_hits:
-    return False, "雨量圖表：依規則強制黑白", hits
-
-  level = "lenient" if _short_line_hits(t_raw, SOFT_COLOR_KEYWORDS) else "normal"
-  has_color, reason, sig = page_has_real_color(page, image_cache, level=level)
-  if rain_hits and ctx_hits:
-    # 雨量與成果圖同頁：需確有彩色（一般門檻）才算彩色。
-    has_color, reason, sig = page_has_real_color(page, image_cache, level="normal")
-    reason = "雨量與成果圖同頁，" + reason
+  has_color, reason, sig = page_has_real_color(page, image_cache, level="normal")
   if sig:
     reason += f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}］"
-  return has_color, reason, hits
+  return has_color, "④實際色彩", reason, c_short, bw_short
 
 
 def _parse_keyword_lines(value):
@@ -342,34 +312,25 @@ def _parse_keyword_lines(value):
           for line in value.replace("，", "\n").replace(",", "\n").splitlines() if line.strip()]
 
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
-  st.caption("判定順序：風險矩陣→黑白；工作進度表等→彩色；雨量圖→黑白（除非同頁有成果圖提示且確有彩色）；其餘依實際圖片／向量／渲染色彩判定。")
-  force_color_keyword_text = st.text_area(
-      "強制彩色關鍵字（每行一項）",
-      value="\n".join(DEFAULT_FORCE_COLOR_KEYWORDS), height=110, key="force_color_keyword_rules"
+  st.markdown(
+      "**判定順序**：①圖表標題含彩色關鍵字 → 彩色　②短行含彩色關鍵字且頁面確有彩色 → 彩色　"
+      "③短行含黑白關鍵字 → 黑白　④其餘依實際圖片／向量色彩判定。  \n"
+      "關鍵字只看圖表標題或短行，內文敘述提到不算；目錄頁不套用。"
   )
-  soft_color_keyword_text = st.text_area(
-      "彩色提示關鍵字（需同頁有實質彩色才採彩色，每行一項）",
-      value="\n".join(DEFAULT_SOFT_COLOR_KEYWORDS), height=90, key="soft_color_keyword_rules"
-  )
-  bw_keyword_text = st.text_area(
-      "雨量等指定黑白圖表關鍵字（每行一項）",
-      value="\n".join(DEFAULT_BW_KEYWORDS), height=130, key="bw_keyword_rules"
-  )
-  risk_bw_keyword_text = st.text_area(
-      "指定黑白風險矩陣關鍵字（每行一項）",
-      value="\n".join(DEFAULT_RISK_BW_KEYWORDS), height=90, key="risk_bw_keyword_rules"
-  )
-  color_context_text = st.text_area(
-      "其他彩色成果提示關鍵字（與雨量同頁時可優先彩色）",
-      value="\n".join(DEFAULT_COLOR_CONTEXT_KEYWORDS), height=130, key="color_context_rules"
-  )
-  st.caption("設定只影響本次分析；可依報告圖表名稱自行增減，命中結果會顯示於逐頁診斷。")
+  col_a, col_b = st.columns(2)
+  with col_a:
+    color_keyword_text = st.text_area(
+        "🎨 彩色關鍵字（每行一項）",
+        value="\n".join(DEFAULT_COLOR_KEYWORDS), height=260, key="color_keyword_rules"
+    )
+  with col_b:
+    bw_keyword_text = st.text_area(
+        "⬛ 黑白關鍵字：雨量、風險矩陣等（每行一項）",
+        value="\n".join(DEFAULT_BW_KEYWORDS), height=260, key="bw_keyword_rules"
+    )
 
-FORCE_COLOR_KEYWORDS = _parse_keyword_lines(force_color_keyword_text)
-SOFT_COLOR_KEYWORDS = _parse_keyword_lines(soft_color_keyword_text)
+COLOR_KEYWORDS = _parse_keyword_lines(color_keyword_text)
 BW_KEYWORDS = _parse_keyword_lines(bw_keyword_text)
-RISK_BW_KEYWORDS = _parse_keyword_lines(risk_bw_keyword_text)
-COLOR_CONTEXT_KEYWORDS = _parse_keyword_lines(color_context_text)
 
 
 uploaded_file = st.file_uploader(
@@ -438,8 +399,6 @@ if uploaded_file is not None:
       t = page.get_text("text") or ""
       # PDF 字型常將「量、歷、年、進、度」等中文字抽取為相容字形（如 量、歷、年、進度）；
       # 先做 NFKC 正規化，避免雨量黑白及工作進度彩色關鍵字漏判。
-      t_lower = unicodedata.normalize("NFKC", t).lower()
-      t_rule = re.sub(r"\s+", "", t_lower)
 
       # 1. 偵測頁面尺寸 (A3 面積或寬度顯著大於 A4)
       rect = page.rect
@@ -447,17 +406,19 @@ if uploaded_file is not None:
       page_area = width * height
       is_a3 = page_area > 600000  # A3 面積門檻判斷
 
-      # 2. 關鍵字規則（風險矩陣黑白、工作進度表彩色、雨量黑白）＋實際色彩判定。
-      has_real_color, color_reason, hits = decide_page_color(
-          page, t_rule, t, image_color_cache
+      # 2. 標題關鍵字規則＋實際色彩判定。
+      has_real_color, rule_label, color_reason, c_hits, bw_hits = decide_page_color(
+          page, t, image_color_cache
       )
-      force_color_hits, rain_bw_hits = hits["force"] + hits["soft"], hits["rain"]
-      risk_bw_hits, color_context_hits = hits["risk"], hits["ctx"]
-
-      color_diagnostics.append((
-          actual_page, "A3" if is_a3 else "A4", has_real_color, color_reason,
-          force_color_hits, rain_bw_hits, risk_bw_hits, color_context_hits
-      ))
+      color_diagnostics.append({
+          "頁碼": actual_page,
+          "尺寸": "A3" if is_a3 else "A4",
+          "結果": "🎨 彩色" if has_real_color else "⬛ 黑白",
+          "依據": rule_label,
+          "說明": color_reason,
+          "彩色關鍵字": "、".join(c_hits),
+          "黑白關鍵字": "、".join(bw_hits),
+      })
 
       if has_real_color:
         if is_a3:
@@ -513,18 +474,15 @@ if uploaded_file is not None:
       )
       st.info(
           "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
-          "風險矩陣、雨量圖固定黑白；工作進度表、立體投影圓等固定彩色；其餘頁面依實際色彩判定。"
+          "圖表標題含彩色關鍵字（工作進度表、GNSS 等）固定彩色；含黑白關鍵字（雨量、風險矩陣）固定黑白；其餘依實際色彩判定。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
-        for pg, size, has_color, reason, force_hits, rain_hits, risk_hits, context_hits in color_diagnostics:
-          decision = "實際內容判定彩色" if has_color else "未偵測到實質彩色"
-          st.write(
-              f"第 {pg} 頁（{size}）：{decision}；{reason}；"
-              f"彩色提示={', '.join(force_hits) or '無'}；"
-              f"雨量黑白={', '.join(rain_hits) or '無'}；"
-              f"風險矩陣黑白={', '.join(risk_hits) or '無'}；"
-              f"彩色成果提示={', '.join(context_hits) or '無'}"
-          )
+        only_hit = st.checkbox("只顯示彩色頁或有關鍵字命中的頁面", value=True, key="diag_filter")
+        rows = [
+            r for r in color_diagnostics
+            if not only_hit or r["結果"].startswith("🎨") or r["彩色關鍵字"] or r["黑白關鍵字"]
+        ]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
 
