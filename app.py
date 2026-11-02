@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -53,7 +54,7 @@ def _color_signature(image, ignore_mask=None):
   hue_bins = [0] * 12
   for i, count in enumerate(hue_hist):
     if count:
-      hue_bins[min(i * 12 // 256, 11)] += count
+      hue_bins[((i * 12 + 128) // 256) % 12] += count  # 以紅色為中心分格，避免紅色被拆成兩個色相
   hue_count = sum(1 for count in hue_bins if count >= max(2, chromatic * 0.002))
   dominant_hue_share = (max(hue_bins) / chromatic) if chromatic else 1.0
 
@@ -147,7 +148,7 @@ def _vector_color_profile(page):
           rgb = tuple(round(v * 255) for v in c[:3])
           colors.add(tuple(v // 24 for v in rgb))
           hue = colorsys.rgb_to_hsv(*(v / 255 for v in rgb))[0]
-          hue_counts[int(hue * 12) % 12] += 1
+          hue_counts[int(hue * 12 + 0.5) % 12] += 1
           found = True
       if not found:
         continue
@@ -193,12 +194,11 @@ def _has_rich_colored_vectors(page, profile=None):
       and (profile["area_ratio"] >= 0.008 or profile["line_ratio"] >= 0.20)
   )
 
-def page_has_real_color(page, image_color_cache=None, level="normal"):
-  """以實際圖片、向量、整頁渲染三層判定實質彩色；回傳 (是否彩色, 原因, 色彩特徵)。"""
+def compute_page_evidence(page, image_color_cache=None):
+  """只做一次的重運算：蒐集頁面的圖片／向量／整頁渲染色彩特徵（與關鍵字規則無關，可快取）。"""
+  ev = {"images": [], "vector": False, "render": None, "img_errors": 0}
   seen = set()
   page_area = max(page.rect.width * page.rect.height, 1.0)
-  image_errors = 0
-  best_sig = None
   for info in page.get_images(full=True):
     xref = info[0]
     if xref in seen:
@@ -206,10 +206,8 @@ def page_has_real_color(page, image_color_cache=None, level="normal"):
     seen.add(xref)
     try:
       placements = page.get_image_rects(xref)
-      largest_placement = max(
-          (r.width * r.height / page_area for r in placements), default=0
-      )
-      if largest_placement < 0.004:
+      largest = max((r.width * r.height / page_area for r in placements), default=0)
+      if largest < 0.004:
         continue
       sig = image_color_cache.get(xref) if image_color_cache is not None else None
       if sig is None:
@@ -225,27 +223,34 @@ def page_has_real_color(page, image_color_cache=None, level="normal"):
         sig = _color_signature(img)
         if image_color_cache is not None:
           image_color_cache[xref] = sig
-      best_sig = sig
-      if _color_rule_ok(sig, level):
-        return True, "嵌入圖片含實質彩色內容", sig
+      ev["images"].append(sig)
     except Exception:
-      # 圖片解碼失敗時不放棄，改由後面的向量／整頁渲染判定（原本是直接略過，會造成 A3 圖漏判）。
-      image_errors += 1
+      ev["img_errors"] += 1
 
-  vector_profile = _vector_color_profile(page)
-  if _has_substantial_colored_vectors(page, vector_profile):
-    return True, "向量彩色圖形達實質面積／線段門檻", best_sig
+  ev["vector"] = bool(_has_substantial_colored_vectors(page, _vector_color_profile(page)))
 
-  # 整頁渲染備援（含無法單獨解碼的圖片）；A3 頁面也使用同一組門檻。
-  pix = page.get_pixmap(dpi=90, colorspace=fitz.csRGB, alpha=False)
-  img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-  text_mask = _text_ignore_mask(page, pix, text_dict=page.get_text("dict"))
-  sig = _color_signature(img, text_mask)
-  if _color_rule_ok(sig, level):
+  # 已有嵌入圖片達最嚴格（rich）等級時，所有等級都成立，免再渲染整頁。
+  if not any(_color_rule_ok(sig, "rich") for sig in ev["images"]):
+    pix = page.get_pixmap(dpi=90, colorspace=fitz.csRGB, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    mask = _text_ignore_mask(page, pix, text_dict=page.get_text("dict"))
+    ev["render"] = _color_signature(img, mask)
+  return ev
+
+
+def evidence_has_color(ev, level="normal"):
+  """依判定等級由已蒐集的特徵判斷彩色；回傳 (是否彩色, 原因, 色彩特徵)。"""
+  for sig in ev["images"]:
+    if _color_rule_ok(sig, level):
+      return True, "嵌入圖片含實質彩色內容", sig
+  # rich 等級（黑白標題頁的例外）不採向量判定，避免風險矩陣的紅黃綠色塊被當成彩色圖。
+  if level != "rich" and ev["vector"]:
+    return True, "向量彩色圖形達實質面積／線段門檻", ev["render"]
+  sig = ev["render"]
+  if sig and _color_rule_ok(sig, level):
     return True, "整頁渲染：非文字區域含實質彩色內容", sig
-
-  note = f"（{image_errors} 張圖片解碼失敗，已改用整頁渲染）" if image_errors else ""
-  return False, "未偵測到實質彩色圖片或圖形" + note, sig
+  note = f"（{ev['img_errors']} 張圖片解碼失敗，已改用整頁渲染）" if ev["img_errors"] else ""
+  return False, "未偵測到實質彩色圖片或圖形" + note, sig or (ev["images"][0] if ev["images"] else None)
 
 
 # ── 判定規則（只有兩份關鍵字清單，且只看「圖表標題／短行」，內文敘述提到不算）──
@@ -257,7 +262,7 @@ DEFAULT_BW_KEYWORDS = [
     "雨量圖", "雨量歷線", "降雨歷線", "降雨量歷線", "雨量柱狀圖",
     "雨量分布圖", "月雨量圖", "日雨量圖", "時雨量圖", "累積雨量圖",
     "雨量統計圖", "歷年雨量圖", "歷年月份雨量圖", "雨量站歷年",
-    "風險等級評估矩陣", "風險評估矩陣", "分數評估矩陣", "風險矩陣", "評估矩陣", "降雨量監測成果圖",
+    "風險等級評估矩陣", "風險評估矩陣", "分數評估矩陣", "風險矩陣", "評估矩陣", "降雨量監測成果圖", "地下水位量測成果",
 ]
 
 
@@ -282,7 +287,7 @@ def _title_hits(raw_text, keywords, caption_only=False):
   return sorted(hits)
 
 
-def decide_page_color(page, t_raw, image_cache):
+def decide_page_color(ev, t_raw):
   """回傳 (是否彩色, 規則, 原因, 彩色關鍵字, 黑白關鍵字)。
 
   判定順序（由上而下，命中即停）：
@@ -301,16 +306,16 @@ def decide_page_color(page, t_raw, image_cache):
   if c_cap:
     return True, "①彩色標題", "圖表標題命中彩色關鍵字", c_short, bw_short
   if c_short:
-    ok, why, sig = page_has_real_color(page, image_cache, level="lenient")
+    ok, why, sig = evidence_has_color(ev, "lenient")
     if ok:
       return True, "②標題＋實際彩色", why, c_short, bw_short
   if bw_short:
-    ok, why, sig = page_has_real_color(page, image_cache, level="rich")
+    ok, why, sig = evidence_has_color(ev, "rich")
     if ok:
       return True, "③黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
     return False, "③黑白標題", "圖表標題命中黑白關鍵字", c_short, bw_short
 
-  has_color, reason, sig = page_has_real_color(page, image_cache, level="normal")
+  has_color, reason, sig = evidence_has_color(ev, "normal")
   if sig:
     reason += f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}］"
   return has_color, "④實際色彩", reason, c_short, bw_short
@@ -442,41 +447,43 @@ if uploaded_file is not None:
 
 
   if is_pdf:
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    file_key = hashlib.md5(file_bytes).hexdigest()
+    if st.session_state.get("pdf_cache_key") != file_key:
+      # 重運算（圖片／向量／渲染）只在新檔案時做一次；之後改關鍵字或操作介面都不會重跑。
+      progress_bar = st.progress(0)
+      status_text = st.empty()
+      doc = fitz.open(stream=file_bytes, filetype="pdf")
+      n_pages = len(doc)
+      image_color_cache = {}
+      analyzed = []
+      progress_step = max(1, n_pages // 80)
+      status_step = max(1, n_pages // 30)
+      for page_num in range(n_pages):
+        if page_num == 0 or (page_num + 1) % progress_step == 0 or page_num + 1 == n_pages:
+          progress_bar.progress((page_num + 1) / n_pages)
+        if page_num == 0 or (page_num + 1) % status_step == 0 or page_num + 1 == n_pages:
+          status_text.text(f"正在深度檢核檔案... (進度: {page_num+1} / {n_pages} 頁)")
+        page = doc[page_num]
+        analyzed.append({
+            "page": page_num + 1,
+            "text": page.get_text("text") or "",
+            "is_a3": page.rect.width * page.rect.height > 600000,  # A3 面積門檻
+            "ev": compute_page_evidence(page, image_color_cache),
+        })
+      progress_bar.empty()
+      status_text.empty()
+      st.session_state["pdf_cache_key"] = file_key
+      st.session_state["pdf_pages"] = analyzed
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    total_pages = len(doc)
+    pdf_pages = st.session_state["pdf_pages"]
+    total_pages = len(pdf_pages)
     a4_color_pages = []
     a3_color_pages = []
     color_diagnostics = []
-    image_color_cache = {}  # 同一 PDF 重複使用的嵌入圖片只分析一次。
-    progress_step = max(1, total_pages // 80)
-    status_step = max(1, total_pages // 30)
 
-    for page_num in range(total_pages):
-      current_progress = (page_num + 1) / total_pages
-      if page_num == 0 or (page_num + 1) % progress_step == 0 or page_num + 1 == total_pages:
-        progress_bar.progress(current_progress)
-      if page_num == 0 or (page_num + 1) % status_step == 0 or page_num + 1 == total_pages:
-        status_text.text(f"正在深度檢核檔案... (進度: {page_num+1} / {total_pages} 頁)")
-
-      page = doc[page_num]
-      actual_page = page_num + 1
-      t = page.get_text("text") or ""
-      # PDF 字型常將「量、歷、年、進、度」等中文字抽取為相容字形（如 量、歷、年、進度）；
-      # 先做 NFKC 正規化，避免雨量黑白及工作進度彩色關鍵字漏判。
-
-      # 1. 偵測頁面尺寸 (A3 面積或寬度顯著大於 A4)
-      rect = page.rect
-      width, height = rect.width, rect.height
-      page_area = width * height
-      is_a3 = page_area > 600000  # A3 面積門檻判斷
-
-      # 2. 標題關鍵字規則＋實際色彩判定。
-      has_real_color, rule_label, color_reason, c_hits, bw_hits = decide_page_color(
-          page, t, image_color_cache
-      )
+    for info in pdf_pages:
+      actual_page, t, is_a3 = info["page"], info["text"], info["is_a3"]
+      has_real_color, rule_label, color_reason, c_hits, bw_hits = decide_page_color(info["ev"], t)
       color_diagnostics.append({
           "頁碼": actual_page,
           "尺寸": "A3" if is_a3 else "A4",
@@ -486,17 +493,9 @@ if uploaded_file is not None:
           "彩色關鍵字": "、".join(c_hits),
           "黑白關鍵字": "、".join(bw_hits),
       })
-
       if has_real_color:
-        if is_a3:
-          a3_color_pages.append(actual_page)
-        else:
-          a4_color_pages.append(actual_page)
-
+        (a3_color_pages if is_a3 else a4_color_pages).append(actual_page)
       page_texts.append((actual_page, t))
-
-    progress_bar.empty()
-    status_text.empty()
 
   else:  # Word 檔案
     with st.spinner("正在解析 Word 結構..."):
