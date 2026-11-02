@@ -48,8 +48,14 @@ def _color_signature(image, ignore_mask=None):
   return chromatic / total, len(hues), len(colors)
 
 
-def _is_real_color_image(image):
+def _is_real_color_image(image, strict=False, color_context=False):
   ratio, hue_count, color_count = _color_signature(image)
+  if strict:
+    min_ratio = 0.010 if color_context else 0.015
+    min_colors = 22 if color_context else 30
+    # 指定黑白頁僅讓色彩豐富、較像實質底圖/照片的影像取得彩色優先；
+    # 雨量曲線的藍紅雙色，以及風險矩陣的少量純色區塊不會通過。
+    return ratio >= min_ratio and hue_count >= 3 and color_count >= min_colors
   return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
 
 
@@ -115,9 +121,39 @@ def _has_substantial_colored_vectors(page):
   )
 
 
-def page_has_real_color(page):
-  """辨識實質彩色圖片/圖形；排除文字色彩與零星向量裝飾。"""
-  # 1) 嵌入圖片：需有足夠的實際頁面佔比，避免小型彩色 Logo/圖示觸發整頁彩印。
+def _has_rich_colored_vectors(page):
+  """指定黑白頁中的彩色優先例外：需是多色且具一定規模的向量底圖。"""
+  colors = set()
+  colored_count = 0
+  covered_area = 0.0
+  line_extent = 0.0
+  page_area = max(page.rect.width * page.rect.height, 1.0)
+  page_diagonal = max((page.rect.width ** 2 + page.rect.height ** 2) ** 0.5, 1.0)
+  try:
+    for item in page.get_drawings():
+      found = False
+      for key in ("color", "fill"):
+        c = item.get(key)
+        if c and len(c) >= 3 and max(c[:3]) - min(c[:3]) >= 0.16:
+          colors.add(tuple(round(v * 15) for v in c[:3]))
+          found = True
+      if found:
+        rect = item.get("rect")
+        if rect:
+          covered_area += max(rect.width, 0) * max(rect.height, 0)
+          line_extent += max(rect.width, rect.height)
+        colored_count += 1
+  except Exception:
+    return False
+  return (
+      len(colors) >= 8
+      and colored_count >= 12
+      and (covered_area / page_area >= 0.008 or line_extent / page_diagonal >= 0.20)
+  )
+
+
+def page_has_real_color(page, bw_priority=False, color_context=False):
+  """辨識實質彩色內容；指定黑白圖表採較嚴格的彩色底圖門檻。"""
   seen = set()
   page_area = max(page.rect.width * page.rect.height, 1.0)
   for info in page.get_images(full=True):
@@ -139,12 +175,19 @@ def page_has_real_color(page):
         continue
       mode = "RGBA" if pix.alpha else "RGB"
       img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-      if _is_real_color_image(img):
-        return True, "嵌入圖片含實質彩色且版面佔比足夠"
+      if _is_real_color_image(img, strict=bw_priority, color_context=color_context):
+        reason = "指定黑白頁中仍偵測到色彩豐富的實質底圖/影像" if bw_priority else "嵌入圖片含實質彩色且版面佔比足夠"
+        return True, reason
     except Exception:
       pass
 
-  # 2) 整頁渲染：遮除 PDF 文字區域後再計算，避免彩色文字/超連結誤判。
+  # 指定黑白頁（雨量圖、風險矩陣）不以圖表線條/區塊顏色觸發彩印。
+  # 但同頁若有色彩豐富的嵌入式平面圖/空拍影像，上方影像檢查仍可保留彩色。
+  if bw_priority:
+    if _has_rich_colored_vectors(page):
+      return True, "指定黑白頁中另有多色且具規模的向量底圖，彩色優先"
+    return False, "命中指定黑白圖表規則；未發現色彩豐富的獨立底圖/影像"
+
   pix = page.get_pixmap(dpi=120, colorspace=fitz.csRGB, alpha=False)
   img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
   text_mask = _text_ignore_mask(page, pix)
@@ -152,11 +195,38 @@ def page_has_real_color(page):
   if ratio >= 0.009 and (hue_count >= 3 or color_count >= 28):
     return True, "非文字區域含實質多色內容"
 
-  # 3) 向量圖形：須有多種顏色及足夠的圖形規模，不再以顏色種類單獨觸發。
   if _has_substantial_colored_vectors(page):
     return True, "向量彩色圖形達實質面積/線段門檻"
   return False, "未偵測到實質彩色圖片或圖形（文字與零星裝飾已排除）"
 
+
+DEFAULT_BW_KEYWORDS = [
+    "雨量", "降雨", "雨量歷線", "降雨歷線", "累積雨量", "時雨量",
+    "日雨量", "雨量站", "雨量圖", "風險等級", "風險評估",
+    "分數評估", "評估矩陣", "風險矩陣", "風險等級評估矩陣",
+]
+DEFAULT_COLOR_CONTEXT_KEYWORDS = [
+    "平面圖", "空拍圖", "正射影像", "航照圖", "彩色影像",
+    "地形影像", "崩塌範圍圖",
+]
+
+def _parse_keyword_lines(value):
+  return [line.strip().lower() for line in value.replace("，", "\n").replace(",", "\n").splitlines() if line.strip()]
+
+with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
+  st.caption("黑白關鍵字只會限制雨量圖、風險矩陣等指定圖表；同頁若另有色彩豐富的平面圖／空拍圖，仍保留彩色優先。關鍵字不會單獨決定頁面顏色。")
+  bw_keyword_text = st.text_area(
+      "指定黑白內容關鍵字（每行一項）",
+      value="\n".join(DEFAULT_BW_KEYWORDS), height=150, key="bw_keyword_rules"
+  )
+  color_context_text = st.text_area(
+      "彩色成果內容提示關鍵字（每行一項）",
+      value="\n".join(DEFAULT_COLOR_CONTEXT_KEYWORDS), height=100, key="color_context_rules"
+  )
+  st.caption("設定只影響本次分析；若要永久保存，可將常用詞保留在預設清單中。")
+
+BW_KEYWORDS = _parse_keyword_lines(bw_keyword_text)
+COLOR_CONTEXT_KEYWORDS = _parse_keyword_lines(color_context_text)
 
 uploaded_file = st.file_uploader(
     "請選擇您的文件檔案", type=["pdf", "docx"], accept_multiple_files=False
@@ -239,13 +309,17 @@ if uploaded_file is not None:
       ]
       has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
 
-      # 雨量／降雨屬黑白限制提示，不可覆蓋同頁其他實質彩色內容。
-      forced_bw_keywords = ["雨量", "降雨"]
-      has_forced_bw_keyword = any(kw in t_lower for kw in forced_bw_keywords)
+      # 指定黑白關鍵字涵蓋雨量圖與風險評估矩陣；彩色成果提示只作輔助辨識。
+      has_forced_bw_keyword = any(kw in t_lower for kw in BW_KEYWORDS)
+      has_color_context_keyword = any(kw in t_lower for kw in COLOR_CONTEXT_KEYWORDS)
 
-      # 3. 實質彩色證據優先；關鍵字只作診斷提示，不可單靠文字強制整頁彩印。
-      has_real_color, color_reason = page_has_real_color(page)
-      color_diagnostics.append((actual_page, "A3" if is_a3 else "A4", color_reason, has_forced_keyword, has_forced_bw_keyword))
+      # 3. 一般頁維持原彩色辨識；指定黑白頁採嚴格影像豐富度門檻，
+      #    避免藍紅雨量曲線或四色風險矩陣把整頁誤判為彩色。
+      has_real_color, color_reason = page_has_real_color(
+          page, bw_priority=has_forced_bw_keyword,
+          color_context=has_color_context_keyword
+      )
+      color_diagnostics.append((actual_page, "A3" if is_a3 else "A4", has_real_color, color_reason, has_forced_keyword, has_forced_bw_keyword, has_color_context_keyword))
 
       # 4. 優先順序：實質彩色內容 > 黑白限制。只有未偵測到實質彩色時，雨量頁才維持黑白。
       if has_real_color:
@@ -303,13 +377,13 @@ if uploaded_file is not None:
       )
       st.info(
           "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
-          "同頁若同時出現雨量/降雨文字與其他實質彩色圖片或圖形，採彩色優先；"
-          "只有未偵測到實質彩色內容的雨量/降雨頁才維持黑白。關鍵字僅作診斷提示，不會單獨強制整頁彩印。"
+          "雨量圖及風險評估矩陣列為指定黑白內容；藍紅曲線或少量色塊不會單獨觸發彩印。"
+          "同頁若另有色彩豐富的平面圖、空拍圖或正射影像，仍保留彩色優先。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
-        for pg, size, reason, forced_color, forced_bw in color_diagnostics:
-          decision = "彩色優先" if "實質彩色" in reason or "向量彩色" in reason or "嵌入圖片" in reason or "非文字區域" in reason else ("黑白限制（未偵測到其他彩色內容）" if forced_bw else "黑白")
-          st.write(f"第 {pg} 頁（{size}）：{decision}；{reason}；彩色關鍵字提示={forced_color}；雨量/降雨黑白提示={forced_bw}")
+        for pg, size, has_color, reason, forced_color, forced_bw, color_context in color_diagnostics:
+          decision = "彩色優先" if has_color else ("指定黑白（未發現獨立彩色底圖）" if forced_bw else "黑白")
+          st.write(f"第 {pg} 頁（{size}）：{decision}；{reason}；彩色內容提示={color_context}；指定黑白關鍵字={forced_bw}")
     else:
       st.warning("⚠️ Word 檔案無法直接精準判定實體尺寸與彩色頁，建議另存成 PDF 後上傳。")
 
