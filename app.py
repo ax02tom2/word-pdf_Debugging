@@ -85,7 +85,7 @@ if uploaded_file is not None:
       page_area = width * height
       is_a3 = page_area > 600000  # A3 面積門檻判斷
 
-      # 2. 強制彩印的關鍵字（工作進度表、GPS、GNSS、雙軸傾斜計、立體投影圓分析相關）
+      # 2. 強制彩印 / 強制黑白關鍵字
       forced_color_keywords = [
           "工作進度表",
           "進度表",
@@ -97,41 +97,42 @@ if uploaded_file is not None:
           "立體投影圓",
           "位態",
       ]
-      has_forced_keyword = any(kw in t_lower for kw in forced_color_keywords)
+      # 規格：雨量 / 降雨相關頁面一律優先判定為黑白，不受像素或彩印關鍵字影響
+      forced_bw_keywords = ["雨量", "降雨"]
+      has_forced_bw_keyword = any(kw in t_lower for kw in forced_bw_keywords)
+      has_forced_keyword = (
+          not has_forced_bw_keyword
+          and any(kw in t_lower for kw in forced_color_keywords)
+      )
 
-      # 3. 嚴格過濾底色干擾的像素色彩分析
-      # 報表中常見的淺綠色/灰色網底（如 R, G, B 數值相近但略有偏差的淡色背景），
-      # 我們必須提高色差門檻與飽和度判定，排除純表格與純文字頁的背景底色誤判。
-      pix = page.get_pixmap(dpi=75)
+      # 3. 嚴格排除表格網底的像素色彩分析
+      # 淺綠、灰色、米色等低彩度底色不應視為真正彩色內容。
+      # 以色度差 (max-min) + HSV 近似飽和度雙門檻判斷，並排除接近白色的淡色網底。
+      pix = page.get_pixmap(dpi=90, colorspace=fitz.csRGB, alpha=False)
       samples = pix.samples
       color_pixel_count = 0
       total_sampled = 0
 
-      for i in range(0, len(samples) - 3, 24):
+      # 每 8 個像素取樣一次，降低運算量並減少固定步長過大造成的漏判
+      for i in range(0, len(samples) - 2, 24):
         total_sampled += 1
         r, g, b = int(samples[i]), int(samples[i + 1]), int(samples[i + 2])
-
-        # 排除接近白色、灰色、以及常見的淺綠色網底（綠色通道偏高但色差不大的淡網底）
-        # 只有當色差非常明顯（代表是真正的彩色圖片、照片或紅藍線條圖表）時計入
         max_rgb = max(r, g, b)
         min_rgb = min(r, g, b)
-        saturation = (
-            (max_rgb - min_rgb) / max_rgb if max_rgb > 0 else 0
-        )  # 計算色彩飽和度
+        chroma = max_rgb - min_rgb
+        saturation = chroma / max_rgb if max_rgb > 0 else 0.0
 
-        # 必須具備一定飽和度（排除淡綠色/灰色背景底色），且 RGB 差異夠大
-        if saturation > 0.18 and (
-            abs(r - g) > 35 or abs(g - b) > 35 or abs(r - b) > 35
-        ):
-          # 同時排除大面積單一淡色網底填滿的情況
-          if not (r > 200 and g > 200 and b > 200):  # 排除亮色區塊
-            color_pixel_count += 1
+        # 必須同時具有明顯色度與飽和度。
+        # 這可排除一般灰階、淺灰底、淡綠底及大部分低彩度表格網底。
+        # 接近白色的微弱色偏也不列入；深色/鮮明圖表線條仍可保留。
+        if chroma >= 55 and saturation >= 0.25 and max_rgb < 250:
+          color_pixel_count += 1
 
       color_ratio = color_pixel_count / total_sampled if total_sampled > 0 else 0
 
       # 4. 綜合判定彩色頁與尺寸分流
       # 必須包含強制關鍵字，或是真正的彩色圖像比例超過 1.5%，才判定為彩色頁
-      if has_forced_keyword or color_ratio > 0.015:
+      if not has_forced_bw_keyword and (has_forced_keyword or color_ratio > 0.015):
         if is_a3:
           a3_color_pages.append(actual_page)
         else:
