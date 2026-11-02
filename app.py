@@ -281,6 +281,16 @@ def _short_line_hits(raw_text, keywords, max_len=40):
   return sorted(hits)
 
 
+def _caption_hits(raw_text, keywords):
+  """關鍵字出現在「圖 x／表 x」開頭的圖表標題行才算。"""
+  hits = set()
+  for line in raw_text.splitlines():
+    n = re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
+    if 0 < len(n) <= 60 and re.match(r"^(圖|表|figure|table)", n):
+      hits.update(kw for kw in keywords if kw in n)
+  return sorted(hits)
+
+
 def decide_page_color(page, t_rule, t_raw, image_cache):
   """回傳 (是否彩色, 原因, 診斷用命中關鍵字 dict)。"""
   force_hits = [kw for kw in FORCE_COLOR_KEYWORDS if kw in t_rule]
@@ -301,6 +311,18 @@ def decide_page_color(page, t_rule, t_raw, image_cache):
       return True, "工作進度表／投影圓等標題＋實質彩色：判定彩色", hits
     return False, "標題命中但頁面無實質彩色：" + why, hits
 
+  # GNSS／GPS／雙軸傾斜計等：圖表標題（圖 x-x …）命中直接彩色；一般短行命中則需有實質彩色佐證。
+  # 此規則優先於雨量，避免內文提到降雨就把整頁 GNSS 圖壓成黑白。
+  if _caption_hits(t_raw, SOFT_COLOR_KEYWORDS) and not _looks_like_toc(t_raw):
+    return True, "GNSS／GPS／傾斜計圖表標題：依規則強制彩色", hits
+  if _short_line_hits(t_raw, SOFT_COLOR_KEYWORDS) and not _looks_like_toc(t_raw):
+    ok, why, sig = page_has_real_color(page, image_cache, level="lenient")
+    if ok:
+      return True, "GNSS／GPS／傾斜計標題＋實質彩色：判定彩色", hits
+
+  # 雨量黑白只看圖表標題／短行，內文敘述提到「降雨」不算。
+  rain_hits = _short_line_hits(t_raw, BW_KEYWORDS)
+  hits["rain"] = rain_hits
   if rain_hits and not ctx_hits:
     return False, "雨量圖表：依規則強制黑白", hits
 
