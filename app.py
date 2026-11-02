@@ -258,11 +258,15 @@ DEFAULT_COLOR_KEYWORDS = [
     "工作進度表", "進度表", "傾斜量歷時曲線", "立體投影圓分析", "立體投影圓", "位態分析",
     "gps", "gnss", "雙軸傾斜計", "變位歷時曲線", "變位歷時", "地質剖面圖",
 ]
+# 絕對黑白：標題／短行命中即黑白，不受頁面彩色圖片影響（你的文字設定一定生效）。
 DEFAULT_BW_KEYWORDS = [
+    "風險等級評估矩陣", "風險評估矩陣", "分數評估矩陣", "風險矩陣", "評估矩陣", "地下水位量測成果",
+]
+# 一般黑白：圖表標題命中時黑白，但同頁若有色相／色階豐富的彩色圖片則例外判彩色（雨量類常與成果圖同頁）。
+DEFAULT_BW_SOFT_KEYWORDS = [
     "雨量圖", "雨量歷線", "降雨歷線", "降雨量歷線", "雨量柱狀圖",
     "雨量分布圖", "月雨量圖", "日雨量圖", "時雨量圖", "累積雨量圖",
-    "雨量統計圖", "歷年雨量圖", "歷年月份雨量圖", "雨量站歷年",
-    "風險等級評估矩陣", "風險評估矩陣", "分數評估矩陣", "風險矩陣", "評估矩陣", "降雨量監測成果圖", "地下水位量測成果",
+    "雨量統計圖", "歷年雨量圖", "歷年月份雨量圖", "雨量站歷年", "降雨量監測成果圖",
 ]
 
 
@@ -319,34 +323,42 @@ def decide_page_color(ev, t_raw):
   """回傳 (是否彩色, 規則, 原因, 彩色關鍵字, 黑白關鍵字)。
 
   判定順序（由上而下，命中即停）：
-    1~2. 標題／短行含「彩色關鍵字」，且頁面有實質彩色圖片／圖形 → 彩色（無圖頁不算）
-    3. 圖表標題含「黑白關鍵字」→ 黑白（同頁有豐富彩色圖片則例外）
-    4. 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
-  目錄頁略過 1~3。
+    ① 標題／短行含「絕對黑白」關鍵字 → 黑白（不受圖片影響）
+    ②③ 標題／短行含「彩色關鍵字」，且頁面有實質彩色圖片／圖形 → 彩色（無圖頁不算）
+    ④ 圖表標題含「一般黑白」關鍵字 → 黑白（同頁有豐富彩色圖片則例外）
+    ⑤ 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
+  目錄頁略過 ①~④。
   """
   toc = _looks_like_toc(t_raw)
   c_cap = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS, caption_only=True)
   c_short = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS)
   # 黑白關鍵字只認「圖／表 x」標題行；圖內座標軸文字（如「日雨量(mm)」）不算。
-  bw_short = [] if toc else _title_hits(t_raw, BW_KEYWORDS, caption_only=True)
+  bw_short = [] if toc else _title_hits(t_raw, BW_SOFT_KEYWORDS, caption_only=True)
+  # 絕對黑白清單：標題行與 40 字內短行都比對。
+  bw_strict = [] if toc else sorted(set(
+      _title_hits(t_raw, BW_KEYWORDS, caption_only=True) + _title_hits(t_raw, BW_KEYWORDS)
+  ))
+
+  if bw_strict:
+    return False, "①絕對黑白", "標題／短行命中「絕對黑白」關鍵字，不受圖片彩色影響", c_short, bw_strict
 
   if c_cap or c_short:
     # 標題命中只是「值得檢查」；頁面必須真有彩色圖片／圖形才判彩色，無圖頁（純文字、目錄式列舉）不算。
     ok, why, sig = evidence_has_color(ev, "lenient")
     if ok:
-      return True, ("①彩色標題＋實際彩色" if c_cap else "②短行關鍵字＋實際彩色"), why, c_short, bw_short
+      return True, ("②彩色標題＋實際彩色" if c_cap else "③短行關鍵字＋實際彩色"), why, c_short, bw_short
     # 沒有彩色證據 → 不採彩色，繼續往下判定（黑白標題或實際色彩）
   if bw_short:
     ok, why, sig = evidence_has_color(ev, "rich")
     if ok:
-      return True, "③黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
+      return True, "④一般黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
     detail = f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}，需占比≥0.010、色相≥3、色階≥50 才例外判彩色］" if sig else "［無圖片／渲染特徵］"
-    return False, "③黑白標題", "圖表標題命中黑白關鍵字" + detail, c_short, bw_short
+    return False, "④一般黑白標題", "圖表標題命中「一般黑白」關鍵字" + detail, c_short, bw_short
 
   has_color, reason, sig = evidence_has_color(ev, "normal")
   if sig:
     reason += f"［占比{sig[0]:.3f}／色相{sig[1]}／色階{sig[2]}］"
-  return has_color, "④實際色彩", reason, c_short, bw_short
+  return has_color, "⑤實際色彩", reason, c_short, bw_short
 
 
 def _parse_keyword_lines(value):
@@ -359,20 +371,36 @@ RULES_PATH = Path(__file__).with_name("keyword_rules.json")
 def _load_saved_rules():
   try:
     data = json.loads(RULES_PATH.read_text(encoding="utf-8"))
-    return data["color"], data["bw"]
+    return _normalize_rules(data)
   except Exception:
-    return DEFAULT_COLOR_KEYWORDS, DEFAULT_BW_KEYWORDS
+    return DEFAULT_COLOR_KEYWORDS, DEFAULT_BW_KEYWORDS, DEFAULT_BW_SOFT_KEYWORDS
+
+
+def _normalize_rules(data):
+  """相容舊版備份（只有 color／bw）：舊 bw 中含「雨」者歸為一般黑白，其餘歸為絕對黑白。"""
+  color = list(data["color"])
+  if "bw_soft" in data:
+    return color, list(data["bw"]), list(data["bw_soft"])
+  soft = [k for k in data["bw"] if "雨" in k]
+  strict = [k for k in data["bw"] if "雨" not in k]
+  return color, strict, soft
+
+
+def _lines(key):
+  return [x for x in st.session_state[key].splitlines() if x.strip()]
 
 
 def _reset_rules():
   st.session_state["color_keyword_rules"] = "\n".join(DEFAULT_COLOR_KEYWORDS)
   st.session_state["bw_keyword_rules"] = "\n".join(DEFAULT_BW_KEYWORDS)
+  st.session_state["bw_soft_keyword_rules"] = "\n".join(DEFAULT_BW_SOFT_KEYWORDS)
 
 
 def _save_rules():
   data = {
-      "color": [x for x in st.session_state["color_keyword_rules"].splitlines() if x.strip()],
-      "bw": [x for x in st.session_state["bw_keyword_rules"].splitlines() if x.strip()],
+      "color": _lines("color_keyword_rules"),
+      "bw": _lines("bw_keyword_rules"),
+      "bw_soft": _lines("bw_soft_keyword_rules"),
   }
   try:
     RULES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -382,15 +410,17 @@ def _save_rules():
 
 
 if "color_keyword_rules" not in st.session_state:
-  _c, _b = _load_saved_rules()
+  _c, _b, _bs = _load_saved_rules()
   st.session_state["color_keyword_rules"] = "\n".join(_c)
   st.session_state["bw_keyword_rules"] = "\n".join(_b)
+  st.session_state["bw_soft_keyword_rules"] = "\n".join(_bs)
 
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
   st.markdown(
-      "**判定順序**：①②標題或短行含彩色關鍵字，且頁面確有彩色圖片／圖形 → 彩色（無圖頁不算）　"
-      "③圖表標題（圖／表 x…）含黑白關鍵字 → 黑白（同頁若有豐富多色圖片則仍判彩色）　"
-      "④其餘依實際圖片／向量色彩判定。  \n"
+      "**判定順序**：①標題／短行含「絕對黑白」關鍵字 → 黑白（不受圖片影響）　"
+      "②③標題或短行含彩色關鍵字，且頁面確有彩色圖片／圖形 → 彩色（無圖頁不算）　"
+      "④圖表標題含「一般黑白」關鍵字 → 黑白（同頁若有色相／色階豐富的彩色圖片則例外判彩色）　"
+      "⑤其餘依實際圖片／向量色彩判定。  \n"
       "標題＝「圖／表＋編號」開頭的行（如 圖 3-5、表2-1），「表示」「圖面」等一般文句不算；彩色關鍵字另可比對 40 字內短行；英文關鍵字（GPS、GNSS）須為獨立單字；含「無」「未提供」等否定語的片段不比對；目錄頁不套用。"
   )
   # 匯入備份：必須在文字框建立之前處理
@@ -398,24 +428,30 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
   if imported is not None and st.session_state.get("rules_imported_id") != (imported.name, imported.size):
     try:
       data = json.loads(imported.getvalue().decode("utf-8"))
-      st.session_state["color_keyword_rules"] = "\n".join(data["color"])
-      st.session_state["bw_keyword_rules"] = "\n".join(data["bw"])
+      _c, _b, _bs = _normalize_rules(data)
+      st.session_state["color_keyword_rules"] = "\n".join(_c)
+      st.session_state["bw_keyword_rules"] = "\n".join(_b)
+      st.session_state["bw_soft_keyword_rules"] = "\n".join(_bs)
       st.session_state["rules_imported_id"] = (imported.name, imported.size)
       st.session_state["rules_msg"] = "✅ 已匯入規則。"
     except Exception:
       st.session_state["rules_imported_id"] = (imported.name, imported.size)
       st.session_state["rules_msg"] = "⚠️ 匯入失敗：檔案格式不正確。"
 
-  col_a, col_b = st.columns(2)
+  col_a, col_b, col_c = st.columns(3)
   with col_a:
     color_keyword_text = st.text_area(
         "🎨 彩色關鍵字（每行一項）", height=260, key="color_keyword_rules"
     )
   with col_b:
     bw_keyword_text = st.text_area(
-        "⬛ 黑白關鍵字：雨量、風險矩陣等（每行一項）", height=260, key="bw_keyword_rules"
+        "⬛ 絕對黑白（命中即黑白，不受圖片影響）", height=260, key="bw_keyword_rules"
     )
-  _short_kw = [k for k in _parse_keyword_lines(color_keyword_text) + _parse_keyword_lines(bw_keyword_text)
+  with col_c:
+    bw_soft_keyword_text = st.text_area(
+        "◾ 一般黑白（有豐富彩色圖則例外判彩色）", height=260, key="bw_soft_keyword_rules"
+    )
+  _short_kw = [k for k in _parse_keyword_lines(color_keyword_text) + _parse_keyword_lines(bw_keyword_text) + _parse_keyword_lines(bw_soft_keyword_text)
                if not k.isascii() and len(k) <= 2]
   if _short_kw:
     st.warning("⚠️ 以下關鍵字只有 2 字以內，容易誤判，建議改成較完整的圖表名稱：" + "、".join(_short_kw))
@@ -426,7 +462,8 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
       "⬇️ 下載備份 (.json)",
       data=json.dumps(
           {"color": [x for x in color_keyword_text.splitlines() if x.strip()],
-           "bw": [x for x in bw_keyword_text.splitlines() if x.strip()]},
+           "bw": [x for x in bw_keyword_text.splitlines() if x.strip()],
+           "bw_soft": [x for x in bw_soft_keyword_text.splitlines() if x.strip()]},
           ensure_ascii=False, indent=2),
       file_name="keyword_rules.json", mime="application/json", use_container_width=True,
   )
@@ -435,6 +472,7 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
 
 COLOR_KEYWORDS = _parse_keyword_lines(color_keyword_text)
 BW_KEYWORDS = _parse_keyword_lines(bw_keyword_text)
+BW_SOFT_KEYWORDS = _parse_keyword_lines(bw_soft_keyword_text)
 
 
 uploaded_file = st.file_uploader(
@@ -572,7 +610,7 @@ if uploaded_file is not None:
       )
       st.info(
           "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
-          "標題含彩色關鍵字（工作進度表、GNSS 等）且頁面有彩色圖形者判彩色；含黑白關鍵字（雨量、風險矩陣）固定黑白；其餘依實際色彩判定。"
+          "標題含彩色關鍵字（工作進度表、GNSS 等）且頁面有彩色圖形者判彩色；「絕對黑白」關鍵字固定黑白，「一般黑白」關鍵字遇豐富彩色圖片可例外；其餘依實際色彩判定。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
         only_hit = st.checkbox("只顯示彩色頁或有關鍵字命中的頁面", value=False, key="diag_filter")
