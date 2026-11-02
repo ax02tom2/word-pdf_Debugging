@@ -1,4 +1,6 @@
 import io
+import json
+from pathlib import Path
 import re
 import unicodedata
 import colorsys
@@ -85,11 +87,14 @@ def _color_rule_ok(sig, level="normal"):
   ratio, hue_count, color_count, dominant_hue_share = sig
   if level == "strict":
     return ratio >= 0.018 and hue_count >= 4 and color_count >= 24 and dominant_hue_share <= 0.86
+  if level == "rich":
+    # 黑白標題頁的例外：必須是色相與色階都很豐富的照片／成果圖，雨量藍紅線與紅黃綠矩陣色塊達不到。
+    return ratio >= 0.02 and hue_count >= 4 and color_count >= 80
   if level == "lenient":
     return ratio >= 0.006 and (hue_count >= 2 or color_count >= 18)
   big = ratio >= 0.015 and color_count >= 10 and (hue_count >= 3 or ratio >= 0.05)
   # 面積占比不大，但色相與色階都很豐富（例如 A3 上的小幅地圖／成果圖）也算彩色。
-  rich = ratio >= 0.004 and hue_count >= 4 and color_count >= 40
+  rich = ratio >= 0.004 and hue_count >= 3 and color_count >= 40
   return big or rich
 
 
@@ -283,14 +288,15 @@ def decide_page_color(page, t_raw, image_cache):
   判定順序（由上而下，命中即停）：
     1. 圖表標題含「彩色關鍵字」→ 彩色
     2. 短行含「彩色關鍵字」且頁面有少量實質彩色 → 彩色
-    3. 短行含「黑白關鍵字」→ 黑白
+    3. 圖表標題含「黑白關鍵字」→ 黑白（同頁有豐富彩色圖片則例外）
     4. 其餘 → 依圖片／向量／整頁渲染的實際色彩判定
   目錄頁略過 1~3。
   """
   toc = _looks_like_toc(t_raw)
   c_cap = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS, caption_only=True)
   c_short = [] if toc else _title_hits(t_raw, COLOR_KEYWORDS)
-  bw_short = [] if toc else _title_hits(t_raw, BW_KEYWORDS)
+  # 黑白關鍵字只認「圖／表 x」標題行；圖內座標軸文字（如「日雨量(mm)」）不算。
+  bw_short = [] if toc else _title_hits(t_raw, BW_KEYWORDS, caption_only=True)
 
   if c_cap:
     return True, "①彩色標題", "圖表標題命中彩色關鍵字", c_short, bw_short
@@ -299,6 +305,9 @@ def decide_page_color(page, t_raw, image_cache):
     if ok:
       return True, "②標題＋實際彩色", why, c_short, bw_short
   if bw_short:
+    ok, why, sig = page_has_real_color(page, image_cache, level="rich")
+    if ok:
+      return True, "③黑白標題但有豐富彩色", "同頁含多色相彩色圖片／圖形，不套用黑白：" + why, c_short, bw_short
     return False, "③黑白標題", "圖表標題命中黑白關鍵字", c_short, bw_short
 
   has_color, reason, sig = page_has_real_color(page, image_cache, level="normal")
@@ -311,23 +320,81 @@ def _parse_keyword_lines(value):
   return [unicodedata.normalize("NFKC", line.strip()).lower()
           for line in value.replace("，", "\n").replace(",", "\n").splitlines() if line.strip()]
 
+RULES_PATH = Path(__file__).with_name("keyword_rules.json")
+
+
+def _load_saved_rules():
+  try:
+    data = json.loads(RULES_PATH.read_text(encoding="utf-8"))
+    return data["color"], data["bw"]
+  except Exception:
+    return DEFAULT_COLOR_KEYWORDS, DEFAULT_BW_KEYWORDS
+
+
+def _reset_rules():
+  st.session_state["color_keyword_rules"] = "\n".join(DEFAULT_COLOR_KEYWORDS)
+  st.session_state["bw_keyword_rules"] = "\n".join(DEFAULT_BW_KEYWORDS)
+
+
+def _save_rules():
+  data = {
+      "color": [x for x in st.session_state["color_keyword_rules"].splitlines() if x.strip()],
+      "bw": [x for x in st.session_state["bw_keyword_rules"].splitlines() if x.strip()],
+  }
+  try:
+    RULES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    st.session_state["rules_msg"] = "✅ 已儲存到伺服器（重開瀏覽器仍在；若主機重啟或重新部署可能消失，建議另外下載備份）。"
+  except Exception as exc:
+    st.session_state["rules_msg"] = f"⚠️ 儲存失敗：{exc}，請改用下載備份。"
+
+
+if "color_keyword_rules" not in st.session_state:
+  _c, _b = _load_saved_rules()
+  st.session_state["color_keyword_rules"] = "\n".join(_c)
+  st.session_state["bw_keyword_rules"] = "\n".join(_b)
+
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
   st.markdown(
       "**判定順序**：①圖表標題含彩色關鍵字 → 彩色　②短行含彩色關鍵字且頁面確有彩色 → 彩色　"
-      "③短行含黑白關鍵字 → 黑白　④其餘依實際圖片／向量色彩判定。  \n"
-      "關鍵字只看圖表標題或短行，內文敘述提到不算；目錄頁不套用。"
+      "③圖表標題（圖／表 x…）含黑白關鍵字 → 黑白（同頁若有豐富多色圖片則仍判彩色）　"
+      "④其餘依實際圖片／向量色彩判定。  \n"
+      "彩色關鍵字看圖表標題或短行；黑白關鍵字只認「圖／表」開頭的標題行；目錄頁不套用。"
   )
+  # 匯入備份：必須在文字框建立之前處理
+  imported = st.file_uploader("匯入先前備份的規則（.json）", type=["json"], key="rules_import")
+  if imported is not None and st.session_state.get("rules_imported_id") != (imported.name, imported.size):
+    try:
+      data = json.loads(imported.getvalue().decode("utf-8"))
+      st.session_state["color_keyword_rules"] = "\n".join(data["color"])
+      st.session_state["bw_keyword_rules"] = "\n".join(data["bw"])
+      st.session_state["rules_imported_id"] = (imported.name, imported.size)
+      st.session_state["rules_msg"] = "✅ 已匯入規則。"
+    except Exception:
+      st.session_state["rules_imported_id"] = (imported.name, imported.size)
+      st.session_state["rules_msg"] = "⚠️ 匯入失敗：檔案格式不正確。"
+
   col_a, col_b = st.columns(2)
   with col_a:
     color_keyword_text = st.text_area(
-        "🎨 彩色關鍵字（每行一項）",
-        value="\n".join(DEFAULT_COLOR_KEYWORDS), height=260, key="color_keyword_rules"
+        "🎨 彩色關鍵字（每行一項）", height=260, key="color_keyword_rules"
     )
   with col_b:
     bw_keyword_text = st.text_area(
-        "⬛ 黑白關鍵字：雨量、風險矩陣等（每行一項）",
-        value="\n".join(DEFAULT_BW_KEYWORDS), height=260, key="bw_keyword_rules"
+        "⬛ 黑白關鍵字：雨量、風險矩陣等（每行一項）", height=260, key="bw_keyword_rules"
     )
+  b1, b2, b3 = st.columns(3)
+  b1.button("💾 儲存規則", on_click=_save_rules, use_container_width=True)
+  b2.button("↩️ 還原預設", on_click=_reset_rules, use_container_width=True)
+  b3.download_button(
+      "⬇️ 下載備份 (.json)",
+      data=json.dumps(
+          {"color": [x for x in color_keyword_text.splitlines() if x.strip()],
+           "bw": [x for x in bw_keyword_text.splitlines() if x.strip()]},
+          ensure_ascii=False, indent=2),
+      file_name="keyword_rules.json", mime="application/json", use_container_width=True,
+  )
+  if st.session_state.get("rules_msg"):
+    st.caption(st.session_state["rules_msg"])
 
 COLOR_KEYWORDS = _parse_keyword_lines(color_keyword_text)
 BW_KEYWORDS = _parse_keyword_lines(bw_keyword_text)
@@ -477,7 +544,7 @@ if uploaded_file is not None:
           "圖表標題含彩色關鍵字（工作進度表、GNSS 等）固定彩色；含黑白關鍵字（雨量、風險矩陣）固定黑白；其餘依實際色彩判定。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
-        only_hit = st.checkbox("只顯示彩色頁或有關鍵字命中的頁面", value=True, key="diag_filter")
+        only_hit = st.checkbox("只顯示彩色頁或有關鍵字命中的頁面", value=False, key="diag_filter")
         rows = [
             r for r in color_diagnostics
             if not only_hit or r["結果"].startswith("🎨") or r["彩色關鍵字"] or r["黑白關鍵字"]
