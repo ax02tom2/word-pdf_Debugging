@@ -179,8 +179,8 @@ def _has_rich_colored_vectors(page, profile=None):
       and (profile["area_ratio"] >= 0.008 or profile["line_ratio"] >= 0.20)
   )
 
-def page_has_real_color(page, bw_priority=False, image_color_cache=None):
-  """辨識實質彩色內容；指定黑白頁只接受多色且具規模的獨立內容。"""
+def page_has_real_color(page, image_color_cache=None):
+  """以固定門檻辨識實質彩色內容；文字關鍵字不會改變圖片或向量的判定門檻。"""
   seen = set()
   page_area = max(page.rect.width * page.rect.height, 1.0)
   for info in page.get_images(full=True):
@@ -193,10 +193,11 @@ def page_has_real_color(page, bw_priority=False, image_color_cache=None):
       largest_placement = max(
           (r.width * r.height / page_area for r in placements), default=0
       )
-      min_placement = 0.015 if bw_priority else 0.004
+      # 所有頁面使用相同的最小影像版面比例，不由文字關鍵字改變門檻。
+      min_placement = 0.004
       if largest_placement < min_placement:
         continue
-      cache_key = (xref, bool(bw_priority))
+      cache_key = xref
       cached_color = image_color_cache.get(cache_key) if image_color_cache is not None else None
       if cached_color is None:
         pix = fitz.Pixmap(page.parent, xref)
@@ -206,22 +207,17 @@ def page_has_real_color(page, bw_priority=False, image_color_cache=None):
           continue
         mode = "RGBA" if pix.alpha else "RGB"
         img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-        cached_color = _is_real_color_image(img, strict=bw_priority)
+        # 影像一律採用內容豐富度門檻，排除雨量藍紅雙系列及少量色塊矩陣。
+        cached_color = _is_real_color_image(img, strict=True)
         if image_color_cache is not None:
           image_color_cache[cache_key] = cached_color
       if cached_color:
-        reason = "指定黑白頁中另有多色且具規模的獨立影像" if bw_priority else "嵌入圖片含實質彩色且版面佔比足夠"
-        return True, reason
+        return True, "嵌入圖片含多色且具規模的實質內容"
     except Exception:
       pass
 
-  # 向量內容只掃描一次；雨量圖常見的藍色柱狀＋紅色標記不會通過嚴格色相數。
+  # 向量內容只掃描一次；雨量圖常見的藍色柱狀＋紅色標記通常不具備足夠的多色分布。
   vector_profile = _vector_color_profile(page)
-  if bw_priority:
-    if _has_rich_colored_vectors(page, vector_profile):
-      return True, "指定黑白頁中另有多色且具規模的向量成果圖，彩色優先"
-    return False, "命中指定黑白圖表規則；未發現其他多色且具規模的彩色成果"
-
   if _has_substantial_colored_vectors(page, vector_profile):
     return True, "向量彩色圖形達實質面積／線段門檻"
 
@@ -230,9 +226,16 @@ def page_has_real_color(page, bw_priority=False, image_color_cache=None):
   img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
   text_dict = page.get_text("dict")
   text_mask = _text_ignore_mask(page, pix, text_dict=text_dict)
-  ratio, hue_count, color_count, _ = _color_signature(img, text_mask)
-  if ratio >= 0.009 and (hue_count >= 3 or color_count >= 28):
-    return True, "非文字區域含實質多色內容"
+  ratio, hue_count, color_count, dominant_hue_share = _color_signature(img, text_mask)
+  # 全頁渲染是最後備援；採用與影像相同的豐富色彩門檻，避免雨量藍紅線／柱及少量矩陣色塊誤判。
+  # 這個門檻對所有頁面一致，不依賴文字關鍵字。
+  if (
+      ratio >= 0.018
+      and hue_count >= 4
+      and color_count >= 24
+      and dominant_hue_share <= 0.86
+  ):
+    return True, "非文字區域含多色且分布充分的實質內容"
 
   return False, "未偵測到實質彩色圖片或圖形（文字與零星裝飾已排除）"
 
@@ -263,9 +266,9 @@ def _parse_keyword_lines(value):
           for line in value.replace("，", "\n").replace(",", "\n").splitlines() if line.strip()]
 
 with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expanded=False):
-  st.caption("強制彩色關鍵字優先級最高；雨量只有在頁面主要內容為雨量圖時才套用黑白。若同頁另有成果圖、平面圖或空拍圖，則彩色優先。")
+  st.caption("關鍵字僅供辨識與診斷，不會直接決定彩色或黑白；最終判定以頁面實際圖片及向量圖形為準。")
   force_color_keyword_text = st.text_area(
-      "強制彩色頁面關鍵字（每行一項）",
+      "彩色內容提示關鍵字（僅供診斷，每行一項）",
       value="\n".join(DEFAULT_FORCE_COLOR_KEYWORDS), height=110, key="force_color_keyword_rules"
   )
   bw_keyword_text = st.text_area(
@@ -280,7 +283,7 @@ with st.expander("⚙️ 彩色／黑白判定規則（可自行調整）", expa
       "其他彩色成果提示關鍵字（與雨量同頁時可優先彩色）",
       value="\n".join(DEFAULT_COLOR_CONTEXT_KEYWORDS), height=130, key="color_context_rules"
   )
-  st.caption("設定只影響本次分析；可依報告圖表名稱自行增減。雨量與風險矩陣是不同規則：雨量允許同頁其他成果內容優先彩色，風險矩陣則預設黑白。")
+  st.caption("設定只影響本次分析；可依報告圖表名稱自行增減。關鍵字命中會顯示於逐頁診斷，但不會覆蓋實際圖形辨識結果。")
 
 FORCE_COLOR_KEYWORDS = _parse_keyword_lines(force_color_keyword_text)
 BW_KEYWORDS = _parse_keyword_lines(bw_keyword_text)
@@ -366,32 +369,17 @@ if uploaded_file is not None:
       # 2. 分別辨識強制彩色、雨量黑白、風險矩陣黑白及其他成果脈絡。
       force_color_hits = [kw for kw in FORCE_COLOR_KEYWORDS if kw in t_rule]
       # 「雨量／降雨」只代表頁面含有雨量內容；搭配成果圖脈絡時不能套用整頁黑白。
-      has_rain_mention = any(kw in t_rule for kw in ("雨量", "降雨", "降雨量"))
       rain_rule_text = re.sub(r"(?:無|沒有|未含|未繪製|未提供)雨量圖(?:表)?", "", t_rule)
       rain_bw_hits = [kw for kw in BW_KEYWORDS if kw in rain_rule_text]
       risk_bw_hits = [kw for kw in RISK_BW_KEYWORDS if kw in t_rule]
       color_context_hits = [kw for kw in COLOR_CONTEXT_KEYWORDS if kw in t_rule]
-      has_forced_keyword = bool(force_color_hits)
-      has_rain_bw_keyword = bool(rain_bw_hits)
-      has_risk_bw_keyword = bool(risk_bw_hits)
-      has_color_context_keyword = bool(color_context_hits)
-      has_forced_bw_keyword = has_rain_bw_keyword or has_risk_bw_keyword
 
-      # 3. 優先順序：明確強制彩色 > 同頁其他成果脈絡 > 指定黑白圖表 > 一般色彩辨識。
-      if has_forced_keyword:
-        has_real_color, color_reason = True, "命中強制彩色關鍵字，彩色優先"
-      elif has_rain_mention and has_color_context_keyword:
-        has_real_color, color_reason = True, "雨量內容與其他成果內容同頁，依規則彩色優先"
-      elif has_risk_bw_keyword and not has_color_context_keyword:
-        has_real_color, color_reason = False, "命中風險等級／分數評估矩陣黑白規則"
-      elif has_forced_bw_keyword:
-        has_real_color, color_reason = page_has_real_color(
-            page, bw_priority=True, image_color_cache=image_color_cache
-        )
-      else:
-        has_real_color, color_reason = page_has_real_color(
-            page, image_color_cache=image_color_cache
-        )
+      # 3. 關鍵字只作診斷，不可直接宣告彩色或整頁覆蓋為黑白。
+      #    所有頁面使用相同的實際圖片／向量辨識門檻，避免頁面文字改變色彩判定標準。
+      #    雨量、風險矩陣等特殊圖表的誤判，應由圖形本身的特徵處理，而非文字關鍵字硬切換門檻。
+      has_real_color, color_reason = page_has_real_color(
+          page, image_color_cache=image_color_cache
+      )
 
       color_diagnostics.append((
           actual_page, "A3" if is_a3 else "A4", has_real_color, color_reason,
@@ -452,14 +440,14 @@ if uploaded_file is not None:
       )
       st.info(
           "💡 系統會略過灰色及低彩度淺綠色表格網底，並排除文字顏色與零星向量裝飾。"
-          "單獨雨量圖與風險評估矩陣依規則列為黑白；雨量若與工作進度、成果圖、平面圖或空拍圖同頁，則彩色優先。"
+          "雨量、風險矩陣及工作進度表等文字僅供診斷；是否彩色仍以實際圖片與向量圖形內容判定，避免純文字關鍵字造成誤判或覆蓋同頁彩色成果。"
       )
       with st.expander("查看逐頁彩色判定診斷（確認誤判/漏判時使用）"):
         for pg, size, has_color, reason, force_hits, rain_hits, risk_hits, context_hits in color_diagnostics:
-          decision = "彩色優先" if has_color else ("指定黑白" if (rain_hits or risk_hits) else "黑白")
+          decision = "實際內容判定彩色" if has_color else "未偵測到實質彩色"
           st.write(
               f"第 {pg} 頁（{size}）：{decision}；{reason}；"
-              f"強制彩色={', '.join(force_hits) or '無'}；"
+              f"彩色提示={', '.join(force_hits) or '無'}；"
               f"雨量黑白={', '.join(rain_hits) or '無'}；"
               f"風險矩陣黑白={', '.join(risk_hits) or '無'}；"
               f"彩色成果提示={', '.join(context_hits) or '無'}"
