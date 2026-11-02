@@ -107,7 +107,7 @@ def _text_ignore_mask(page, pix, text_dict=None):
         for span in line.get("spans", []):
           x0, y0, x1, y1 = span.get("bbox", (0, 0, 0, 0))
           # 僅遮文字字框，保留相鄰的圖表線條及底圖。
-          pad = 1.2
+          pad = 2.5
           box = (
               int((x0 - page.rect.x0 - pad) * scale_x),
               int((y0 - page.rect.y0 - pad) * scale_y),
@@ -271,6 +271,16 @@ def _looks_like_toc(text):
   return len(leaders) >= 3 or any(k in text[:200] for k in ("目錄", "目次"))
 
 
+def _short_line_hits(raw_text, keywords, max_len=40):
+  """只計入出現在「短行」（圖表標題／圖說）的關鍵字，內文敘述中提到不算。"""
+  hits = set()
+  for line in raw_text.splitlines():
+    n = re.sub(r"\s+", "", unicodedata.normalize("NFKC", line).lower())
+    if 0 < len(n) <= max_len:
+      hits.update(kw for kw in keywords if kw in n)
+  return sorted(hits)
+
+
 def decide_page_color(page, t_rule, t_raw, image_cache):
   """回傳 (是否彩色, 原因, 診斷用命中關鍵字 dict)。"""
   force_hits = [kw for kw in FORCE_COLOR_KEYWORDS if kw in t_rule]
@@ -283,13 +293,18 @@ def decide_page_color(page, t_rule, t_raw, image_cache):
 
   if risk_hits:
     return False, "風險矩陣：依規則強制黑白", hits
-  if force_hits and not _looks_like_toc(t_raw):
-    return True, "工作進度表／投影圓等：依規則強制彩色", hits
+  title_force = _short_line_hits(t_raw, FORCE_COLOR_KEYWORDS)
+  if title_force and not _looks_like_toc(t_raw):
+    # 標題命中仍需頁面有少量實質彩色佐證，純文字頁不會因內文提到而變彩色。
+    ok, why, sig = page_has_real_color(page, image_cache, level="lenient")
+    if ok:
+      return True, "工作進度表／投影圓等標題＋實質彩色：判定彩色", hits
+    return False, "標題命中但頁面無實質彩色：" + why, hits
 
   if rain_hits and not ctx_hits:
     return False, "雨量圖表：依規則強制黑白", hits
 
-  level = "lenient" if soft_hits else "normal"
+  level = "lenient" if _short_line_hits(t_raw, SOFT_COLOR_KEYWORDS) else "normal"
   has_color, reason, sig = page_has_real_color(page, image_cache, level=level)
   if rain_hits and ctx_hits:
     # 雨量與成果圖同頁：需確有彩色（一般門檻）才算彩色。
